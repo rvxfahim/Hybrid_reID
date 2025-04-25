@@ -13,19 +13,124 @@ import numpy as np
 import torch
 import torchvision
 from torchvision.transforms import transforms
+from torchvision.models import ResNet50_Weights
 import time
 import os
+import signal
 from collections import deque
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from collections import defaultdict
 from PIL import Image
+import cProfile
+import pstats
+import datetime
+from functools import wraps
+import sys
 
 # Deep SORT and feature extraction imports
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from deep_sort_realtime.deep_sort import nn_matching
 from deep_sort_realtime.deep_sort.detection import Detection
 
+# Global profiler
+profiler = cProfile.Profile()
+
+profiling_stats = {}
+
+# Performance profiling decorator
+def profile_function(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Initialize function stats in the global dictionary if not present
+        if func.__qualname__ not in profiling_stats:
+            profiling_stats[func.__qualname__] = {
+                'call_count': 0,
+                'total_time': 0,
+                'min_time': float('inf'),
+                'max_time': 0
+            }
+            
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        execution_time = end_time - start_time
+        
+        # Update stats in the global dictionary
+        stats = profiling_stats[func.__qualname__]
+        stats['call_count'] += 1
+        stats['total_time'] += execution_time
+        stats['min_time'] = min(stats['min_time'], execution_time)
+        stats['max_time'] = max(stats['max_time'], execution_time)
+        
+        return result
+    return wrapper
+
+# Function to collect and display profiling stats
+def display_profiling_stats():
+    """Collects and displays profiling statistics for key functions"""
+    if not profiling_stats:
+        print("\nNo profiling statistics collected. Make sure functions are decorated with @profile_function.")
+        return
+        
+    print("\n===== PERFORMANCE PROFILING RESULTS =====")
+    print("{:<40} {:<10} {:<15} {:<15} {:<15}".format(
+        "Function", "Calls", "Total Time (s)", "Avg Time (s)", "Max Time (s)"))
+    print("="*95)
+    
+    # Sort functions by total execution time (descending)
+    sorted_stats = sorted(profiling_stats.items(), key=lambda x: x[1]['total_time'], reverse=True)
+    
+    # Display results
+    for func_name, stats in sorted_stats:
+        avg_time = stats['total_time'] / stats['call_count'] if stats['call_count'] > 0 else 0
+        print("{:<40} {:<10} {:<15.4f} {:<15.4f} {:<15.4f}".format(
+            func_name, 
+            stats['call_count'], 
+            stats['total_time'], 
+            avg_time,
+            stats['max_time']
+        ))
+    
+    print("\n===== BOTTLENECK ANALYSIS =====")
+    
+    # Find the bottleneck (function with highest total time)
+    if sorted_stats:
+        bottleneck = sorted_stats[0]
+        func_name = bottleneck[0]
+        stats = bottleneck[1]
+        avg_time = stats['total_time'] / stats['call_count'] if stats['call_count'] > 0 else 0
+        
+        print(f"Main bottleneck: {func_name} - {stats['total_time']:.4f}s total ({avg_time:.4f}s avg)")
+        
+        # Function-specific recommendations
+        if "YOLODetector.detect" in func_name:
+            print("Recommendations for YOLO detection bottleneck:")
+            print("1. Consider using a smaller/faster YOLO model (nano instead of small)")
+            print("2. Reduce input resolution for detection")
+            print("3. Implement frame skipping (detect every N frames)")
+            print("4. Ensure you're using GPU acceleration properly")
+        
+        elif "FeatureExtractor.extract_features_batch" in func_name:
+            print("Recommendations for feature extraction bottleneck:")
+            print("1. Use a smaller feature extractor model")
+            print("2. Reduce input resolution for the feature extractor")
+            print("3. Extract features less frequently")
+            print("4. Optimize batch processing to minimize GPU transfers")
+        
+        elif "HybridTracker.update" in func_name:
+            print("Recommendations for tracker update bottleneck:")
+            print("1. Simplify feature matching logic")
+            print("2. Reduce frequency of re-identification")
+            print("3. Optimize data structures for faster lookup")
+        
+        elif "HybridTracker._perform_offline_reid" in func_name:
+            print("Recommendations for re-identification bottleneck:")
+            print("1. Reduce re_id_interval (perform less frequently)")
+            print("2. Reduce gallery size to compare fewer features")
+            print("3. Implement more efficient feature matching")
+    
+    print("\n===== END OF PROFILING REPORT =====\n")
 
 class FeatureExtractor:
     def __init__(self, model_path=None, device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -42,7 +147,7 @@ class FeatureExtractor:
         # Initialize model - ResNet50 is commonly used for ReID tasks
         if model_path is None or not os.path.exists(model_path):
             print("Loading pre-trained ResNet50 model")
-            self.model = torchvision.models.resnet50(pretrained=True)
+            self.model = torchvision.models.resnet50(weights=ResNet50_Weights.DEFAULT)
             # Remove the final FC layer to get feature vectors
             self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
         else:
@@ -61,54 +166,105 @@ class FeatureExtractor:
         
         self.feature_dim = 2048  # ResNet50 feature dimension
     
-    def extract_features(self, frame, bbox):
+    @profile_function
+    def extract_features_batch(self, frame, bboxes):
         """
-        Extract features from the given bounding box in the frame
+        Extract features for multiple bounding boxes in a single GPU operation
         
         Args:
             frame: Current video frame (BGR format)
-            bbox: Bounding box as [x1, y1, x2, y2]
+            bboxes: List of bounding boxes as [x1, y1, x2, y2]
             
         Returns:
-            Feature vector (numpy array)
+            Batch of feature vectors (numpy array)
         """
-        try:
-            # Convert bbox to integers
-            x1, y1, x2, y2 = map(int, bbox)
+        if not bboxes:
+            return []
             
-            # Ensure coordinates are within frame boundaries
-            height, width = frame.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(width, x2), min(height, y2)
-            
-            if x2 <= x1 or y2 <= y1:
-                return np.zeros(self.feature_dim, dtype=np.float32)
-            
-            # Crop the object from the frame
-            crop = frame[y1:y2, x1:x2]
-            
-            # Convert from BGR to RGB
-            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            
-            # Convert to PIL Image and apply transforms
-            img = Image.fromarray(crop)
-            img = self.transform(img).unsqueeze(0).to(self.device)
-            
-            # Extract features
-            with torch.no_grad():
-                features = self.model(img)
-                features = features.squeeze().cpu().numpy()
-            
-            # Normalize the feature vector
-            features = features / np.linalg.norm(features)
-            
-            return features.astype(np.float32)
+        crops = []
+        valid_indices = []
         
-        except Exception as e:
-            print(f"Error extracting features: {e}")
-            return np.zeros(self.feature_dim, dtype=np.float32)
+        # Prepare crops for all valid bounding boxes
+        for i, bbox in enumerate(bboxes):
+            try:
+                x1, y1, x2, y2 = map(int, bbox)
+                
+                # Ensure coordinates are within frame boundaries
+                height, width = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                    
+                crop = frame[y1:y2, x1:x2]
+                crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(crop)
+                crops.append(self.transform(img))
+                valid_indices.append(i)
+                
+            except Exception as e:
+                continue
+                
+        # Process all crops in a single batch
+        if not crops:
+            return [np.zeros(self.feature_dim, dtype=np.float32)] * len(bboxes)
+            
+        # Stack crops into a batch tensor
+        batch = torch.stack(crops).to(self.device)
+        
+        # Extract features in a single forward pass
+        with torch.no_grad():
+            features_batch = self.model(batch)
+            features_batch = features_batch.squeeze().cpu().numpy()
+            
+        # If only one crop, ensure we have correct dimensions
+        if len(crops) == 1:
+            features_batch = features_batch.reshape(1, -1)
+            
+        # Normalize feature vectors
+        features_batch = features_batch / np.linalg.norm(features_batch, axis=1, keepdims=True)
+        
+        # Create result array with zeros for invalid bboxes
+        result = [np.zeros(self.feature_dim, dtype=np.float32)] * len(bboxes)
+        for i, valid_idx in enumerate(valid_indices):
+            result[valid_idx] = features_batch[i].astype(np.float32)
+            
+        return result
 
-
+def compute_cosine_distance_gpu(features1, features2, threshold=1.0):
+    """
+    Compute cosine distance between two sets of features on GPU
+    Args:
+        features1: First set of feature vectors (numpy array)
+        features2: Second set of feature vectors (numpy array)
+        threshold: Maximum distance threshold
+    Returns:
+        Distance matrix (numpy array)
+    """
+    if len(features1) == 0 or len(features2) == 0:
+        return np.array([])
+    # Convert to PyTorch tensors and move to GPU
+    features1_tensor = torch.tensor(features1, dtype=torch.float32).cuda()
+    features2_tensor = torch.tensor(features2, dtype=torch.float32).cuda()
+    # Normalize on GPU if needed
+    f1_norm = torch.norm(features1_tensor, dim=1, keepdim=True)
+    f2_norm = torch.norm(features2_tensor, dim=1, keepdim=True)
+    # Avoid division by zero
+    f1_norm = torch.where(f1_norm == 0, torch.ones_like(f1_norm), f1_norm)
+    f2_norm = torch.where(f2_norm == 0, torch.ones_like(f2_norm), f2_norm)
+    features1_normalized = features1_tensor / f1_norm
+    features2_normalized = features2_tensor / f2_norm
+    # Calculate cosine similarity matrix: (a·b)/(|a|·|b|)
+    similarity = torch.mm(features1_normalized, features2_normalized.t())
+    # Convert to distance: 1 - similarity
+    distance = 1.0 - similarity
+    # Apply threshold if needed
+    if threshold < 1.0:
+        distance = torch.clamp(distance, 0.0, threshold)
+    # Return as numpy array
+    return distance.cpu().numpy()
+    
 class HybridTracker:
     def __init__(self, max_cosine_distance=0.4, nn_budget=None, max_age=30, min_confidence=0.3,
                  re_id_interval=50, gallery_size=100, iou_threshold=0.3, model_path=None):
@@ -161,6 +317,30 @@ class HybridTracker:
         
         print("Hybrid tracker initialized with DeepSORT and Re-ID components")
     
+    def update_feature_galleries_batch(self, frame, tracks):
+        """Update feature galleries for multiple tracks in a single GPU operation"""
+        if not tracks:
+            return
+
+        # Extract bboxes for feature extraction
+        bboxes = [track[:4] for track in tracks]  # [x1, y1, x2, y2]
+        track_ids = [int(track[4]) for track in tracks]  # consistent_ids
+
+        # Extract features in a batch
+        features_batch = self.feature_extractor.extract_features_batch(frame, bboxes)
+
+        # Update galleries with the new features
+        for i, (track_id, feature) in enumerate(zip(track_ids, features_batch)):
+            if np.all(feature == 0):
+                continue  # Skip invalid features
+            
+            if track_id not in self.feature_gallery:
+                self.feature_gallery[track_id] = deque(maxlen=self.gallery_size)
+
+            self.feature_gallery[track_id].append(feature)
+            self.last_seen_frame[track_id] = self.frame_count
+        
+    @profile_function
     def update(self, frame, detections):
         """
         Update the tracker with new detections
@@ -278,18 +458,6 @@ class HybridTracker:
             center_y = (bbox_ltrb[1] + bbox_ltrb[3]) / 2
             self.track_history[consistent_id].append((center_x, center_y))
 
-            # Update feature gallery and last seen frame using the obtained feature
-            # Check feature dimension consistency before adding
-            if current_feature.shape[0] == self.feature_dim:
-                if consistent_id not in self.feature_gallery:
-                    self.feature_gallery[consistent_id] = deque(maxlen=self.gallery_size)
-                # Only append valid features
-                if not np.all(current_feature == 0):
-                   self.feature_gallery[consistent_id].append(current_feature)
-            # else:
-            #      print(f"Warning: Feature dimension mismatch for track {consistent_id}. Expected {self.feature_dim}, got {current_feature.shape[0]}. Not adding to gallery.")
-
-
             self.last_seen_frame[consistent_id] = self.frame_count
 
             if consistent_id in self.inactive_ids:
@@ -303,6 +471,9 @@ class HybridTracker:
 
             current_tracks.append([*bbox_ltrb, consistent_id, track_class_id]) # Use LTRB and consistent ID
 
+        # Add batch update right after tracks are processed, before re-ID
+        self.update_feature_galleries_batch(frame, current_tracks)
+    
         # Run periodic re-identification for long-term tracking
         if self.frame_count % self.re_id_interval == 0:
             self._perform_offline_reid(frame) # Pass frame if needed by re-id logic, otherwise remove
@@ -338,81 +509,65 @@ class HybridTracker:
         # Ensure current_features is a valid numpy array and not all zeros
         if not isinstance(current_features, np.ndarray) or np.all(current_features == 0) or len(self.inactive_ids) == 0:
             return None
-
+    
+        # Check feature dimension consistency
+        expected_dim = self.feature_extractor.feature_dim  # Usually 2048 for ResNet50
+        if current_features.shape[-1] != expected_dim:
+            print(f"Warning: Feature dimension mismatch. Expected {expected_dim}, got {current_features.shape[-1]}.")
+            # Extract features ourselves instead of using potentially incompatible ones
+            current_features = self.feature_extractor.extract_features_batch(frame, [bbox])[0]
+            if np.all(current_features == 0):
+                return None
+        
         best_match_id = None
         # Use a lower threshold for re-id matching (higher similarity needed)
         best_match_score = 0.6 # Max allowed cosine distance for re-id (adjust as needed)
-
+        
+        all_gallery_features = []
+        gallery_id_map = []
+        
         for inactive_id in self.inactive_ids:
-            if inactive_id not in self.feature_gallery:
-                continue
-
-            gallery_features = self.feature_gallery[inactive_id]
-            if not gallery_features: # Check if deque is empty
-                continue
-
-            # Calculate feature similarity (cosine distance)
-            # Ensure gallery features are also valid numpy arrays
-            valid_gallery_features = [f for f in gallery_features if isinstance(f, np.ndarray) and f.shape == current_features.shape]
-            if not valid_gallery_features:
-                continue
-
-            # Calculate distances only against valid features
-            distances = nn_matching.distance_metric('cosine', best_match_score, None).distance(
-                 current_features.reshape(1, -1), # Reshape current features
-                 np.asarray(valid_gallery_features) # Convert gallery features to numpy array
-            ) # This returns a (1, N) matrix of distances
-
-            if distances.size == 0: # Handle case where no valid gallery features matched shape
-                 continue
-
-            min_distance = np.min(distances)
-
-            # Check if this is the best match so far and below the threshold
-            if min_distance < best_match_score:
-                 # If considering multiple matches, store them and decide later
-                 # For now, take the first one that's good enough (greedy)
-                 # Or find the absolute best:
-                 # if min_distance < best_match_score: # Compare with current best threshold
-                 #    best_match_score = min_distance
-                 #    best_match_id = inactive_id
-
-                 # Let's take the first sufficiently good match for simplicity now
-                 best_match_id = inactive_id
-                 # print(f"Potential Re-ID match: current detection with inactive ID {inactive_id}, distance: {min_distance:.4f}")
-                 break # Found a good enough match
-
-        # Optional: Add motion prediction check as a secondary factor if no appearance match found
-        # (Your original code had this, keep it if desired, but appearance should be primary)
-        if best_match_id is None:
-             # Check motion only if appearance failed
-             center_x = (bbox[0] + bbox[2]) / 2
-             center_y = (bbox[1] + bbox[3]) / 2
-             motion_match_id = None
-             min_motion_dist = 100 # Pixel threshold for motion matching
-
-             for inactive_id in self.inactive_ids:
-                  if inactive_id in self.kalman_predictions:
-                       pred_x, pred_y = self.kalman_predictions[inactive_id]
-                       distance = np.sqrt((pred_x - center_x)**2 + (pred_y - center_y)**2)
-                       if distance < min_motion_dist:
-                            # print(f"Potential motion match: current detection with inactive ID {inactive_id}, distance: {distance:.2f} pixels")
-                            # This is a weaker match, maybe only use if appearance fails completely?
-                            # For now, let's not override appearance match result.
-                            # motion_match_id = inactive_id # Store potential motion match
-                            pass # Don't assign yet, prioritize appearance
-
-
-        return best_match_id # Return appearance match primarily
+            if inactive_id in self.feature_gallery:
+                gallery = self.feature_gallery[inactive_id]
+                # Add dimension check to filter incompatible features
+                valid_features = [f for f in gallery if isinstance(f, np.ndarray) and f.shape[-1] == expected_dim]
+                
+                if valid_features:
+                    all_gallery_features.extend(valid_features)
+                    gallery_id_map.extend([inactive_id] * len(valid_features))
+        
+        if not all_gallery_features:
+            return None
+            
+        # Compute distances in one GPU operation
+        distances = compute_cosine_distance_gpu(
+            current_features.reshape(1, -1),
+            np.array(all_gallery_features),
+            threshold=0.6
+        )
+        
+        if distances.size == 0:
+            return None
+            
+        # Find best match
+        min_idx = np.argmin(distances[0])
+        min_distance = distances[0][min_idx]
+        
+        if min_distance < 0.6:  # threshold
+            best_match_id = gallery_id_map[min_idx]
+            return best_match_id
+        
+        return None
 
 
     # --- Make sure _perform_offline_reid uses features correctly ---
+    @profile_function
     def _perform_offline_reid(self, frame):
         """
-        Perform offline re-identification to merge IDs potentially belonging to the same object.
-        This focuses on merging an active track with a recently inactive one if they look similar.
+        Perform offline re-identification using GPU-batched distance calculation.
+        Merges an active track with a recently inactive one if they look similar.
         Args:
-            frame: Current video frame (may not be needed)
+            frame: Current video frame (may not be needed directly here)
         """
         active_ids = set(self.id_mapping.values()) - self.inactive_ids
         inactive_ids_list = list(self.inactive_ids)
@@ -420,129 +575,226 @@ class HybridTracker:
         if not active_ids or not inactive_ids_list:
             return
 
-        # Compare each active ID with each inactive ID
-        ids1 = list(active_ids)
-        ids2 = inactive_ids_list
+        # --- 1. Gather Features and Create Index Maps ---
+        all_active_features = []
+        active_feature_indices = {}  # Map: active_id -> [list of indices in all_active_features]
+
+        all_inactive_features = []
+        inactive_feature_indices = {} # Map: inactive_id -> [list of indices in all_inactive_features]
+
+        valid_active_ids = []
+        # Collect features for active IDs
+        for id1 in active_ids:
+            features1 = self.feature_gallery.get(id1)
+            if not features1: continue
+            recent_features1 = [f for f in list(features1)[-5:] if isinstance(f, np.ndarray)] # Take last 5 valid features
+            if not recent_features1: continue
+
+            start_idx = len(all_active_features)
+            all_active_features.extend(recent_features1)
+            end_idx = len(all_active_features)
+            active_feature_indices[id1] = list(range(start_idx, end_idx))
+            valid_active_ids.append(id1)
+
+        valid_inactive_ids = []
+        # Collect features for inactive IDs
+        for id2 in inactive_ids_list:
+            features2 = self.feature_gallery.get(id2)
+            if not features2: continue
+            gallery_features2 = [f for f in features2 if isinstance(f, np.ndarray)] # Take all valid features
+            if not gallery_features2: continue
+
+            start_idx = len(all_inactive_features)
+            all_inactive_features.extend(gallery_features2)
+            end_idx = len(all_inactive_features)
+            inactive_feature_indices[id2] = list(range(start_idx, end_idx))
+            valid_inactive_ids.append(id2)
+
+        if not all_active_features or not all_inactive_features:
+            # print("Offline ReID: No features to compare.")
+            return # Nothing to compare
+
+        # Convert lists to NumPy arrays just before GPU call
+        # Check for shape consistency (assuming all features should have the same dim)
+        try:
+            active_features_np = np.asarray(all_active_features, dtype=np.float32)
+            inactive_features_np = np.asarray(all_inactive_features, dtype=np.float32)
+        except ValueError as e:
+             print(f"Offline ReID Error: Could not create numpy arrays from features. Possible shape mismatch? Error: {e}")
+             # Example: Check shapes if possible
+             # if all_active_features: print(f"First active feature shape: {all_active_features[0].shape}")
+             # if all_inactive_features: print(f"First inactive feature shape: {all_inactive_features[0].shape}")
+             return # Cannot proceed
+
+        if active_features_np.shape[0] == 0 or inactive_features_np.shape[0] == 0:
+             print("Offline ReID: Feature arrays are empty after conversion.")
+             return
+
+        # --- 2. Batch Distance Calculation using GPU ---
+        print(f"Offline ReID: Calculating distances between {active_features_np.shape[0]} active and {inactive_features_np.shape[0]} inactive features using GPU.")
+
+        # <<< Integration Point >>>
+        # Call your GPU function here. Pass threshold=1.0 consistent with nn_matching's usual max_distance.
+        full_distance_matrix = compute_cosine_distance_gpu(
+            active_features_np,
+            inactive_features_np,
+            threshold=1.0  # Clamp distances > 1.0 (low similarity)
+        )
+
+        # Check if GPU calculation failed (e.g., returned empty)
+        if full_distance_matrix is None or full_distance_matrix.size == 0 or full_distance_matrix.shape != (active_features_np.shape[0], inactive_features_np.shape[0]):
+            print("Offline ReID: GPU distance calculation failed or returned unexpected result. Skipping merge for this frame.")
+            return # Abort merge if distance calculation failed
+
+        print("Offline ReID: GPU distance calculation complete.")
+
+        # --- 3. Extract Minimums and Build Merge Candidates ---
         merge_candidates = []
+        merge_threshold = 0.3 # Your similarity threshold (applied AFTER distance calculation)
 
-        for i, id1 in enumerate(ids1): # Active IDs
-             features1 = self.feature_gallery.get(id1)
-             if not features1: continue
-             # Get the most recent feature(s) for the active track
-             recent_features1 = [f for f in list(features1)[-5:] if isinstance(f, np.ndarray)] # Take last 5 valid features
-             if not recent_features1: continue
+        for id1 in valid_active_ids: # Iterate through ACTIVE track IDs that had features
+            indices1 = active_feature_indices.get(id1) # Use .get for safety
+            if not indices1: continue
 
-             for j, id2 in enumerate(ids2): # Inactive IDs
-                 if id1 == id2: continue # Should not happen based on sets, but good check
+            for id2 in valid_inactive_ids: # Iterate through INACTIVE track IDs that had features
+                if id1 == id2: continue # Cannot merge with self
 
-                 features2 = self.feature_gallery.get(id2)
-                 if not features2: continue
-                 # Get representative features for the inactive track
-                 gallery_features2 = [f for f in features2 if isinstance(f, np.ndarray)] # Take all valid features
-                 if not gallery_features2: continue
+                indices2 = inactive_feature_indices.get(id2) # Use .get for safety
+                if not indices2: continue
 
-                 # Ensure feature dimensions match before calculating distance
-                 if recent_features1[0].shape != gallery_features2[0].shape:
-                      continue
+                # Efficiently select the sub-matrix corresponding to this pair of IDs
+                try:
+                    sub_matrix = full_distance_matrix[np.ix_(indices1, indices2)]
+                except IndexError as e:
+                    print(f"Offline ReID Error: Indexing failed for id1={id1}, id2={id2}. Indices1={indices1}, Indices2={indices2}, MatrixShape={full_distance_matrix.shape}. Error: {e}")
+                    continue # Skip this pair
 
-                 # Calculate cosine distance between the recent features of active track
-                 # and all features of the inactive track.
-                 distances = nn_matching.distance_metric('cosine', 1.0, None).distance(
-                     np.asarray(recent_features1),
-                     np.asarray(gallery_features2)
-                 ) # Returns (N_active, M_inactive) matrix
+                if sub_matrix.size == 0: continue # No valid feature pairs between these IDs
 
-                 if distances.size == 0: continue
+                # Find the minimum distance within this specific ID-pair's features
+                min_distance = np.min(sub_matrix)
 
-                 # Use min distance as a measure of similarity potential
-                 min_distance = np.min(distances)
-
-                 # Use a strict threshold for merging (e.g., 0.3 means high similarity)
-                 merge_threshold = 0.3
-                 if min_distance < merge_threshold:
-                     # Store potential merge pair (active, inactive, score)
-                     merge_candidates.append((id1, id2, min_distance))
-                     # print(f"Offline ReID Candidate: Merge inactive {id2} into active {id1}? Dist: {min_distance:.4f}")
+                # Check against the merge threshold
+                if min_distance < merge_threshold:
+                    merge_candidates.append((id1, id2, min_distance))
+                    # print(f"Offline ReID Candidate: Merge inactive {id2} into active {id1}? Dist: {min_distance:.4f}")
 
 
-        # Resolve merge candidates (e.g., using Hungarian algorithm or simply best match)
-        # Simple greedy approach: Sort by distance and merge non-conflicting pairs
+        # --- 4. Resolve Merge Candidates (Same as your original code) ---
         merge_candidates.sort(key=lambda x: x[2]) # Sort by distance (ascending)
         merged_inactive = set()
         final_merges = {} # {inactive_id_to_remove: active_id_to_keep}
 
         for active_id, inactive_id, score in merge_candidates:
             if inactive_id not in merged_inactive and active_id not in final_merges.values():
-                 # Ensure the inactive track hasn't been seen *too* long ago? Optional.
+                 # Optional frame gap check (uncomment if needed)
                  # frames_missing = self.frame_count - self.last_seen_frame.get(inactive_id, self.frame_count)
-                 # if frames_missing > 100: continue # Example: Don't merge very old tracks
+                 # max_allowed_missing = 100
+                 # if frames_missing > max_allowed_missing: continue
 
                  print(f"Offline ReID: Merging inactive ID {inactive_id} into active ID {active_id} (distance: {score:.4f})")
                  final_merges[inactive_id] = active_id
                  merged_inactive.add(inactive_id)
 
-        # Apply the merges
+
+        # --- 5. Apply the Merges (Same as your original code, with minor robustness additions) ---
+        if final_merges:
+            print(f"Offline ReID: Applying {len(final_merges)} merges.")
         for remove_id, keep_id in final_merges.items():
+            # Ensure both IDs still exist in relevant structures before proceeding
+            if remove_id not in self.feature_gallery or keep_id not in self.feature_gallery:
+                 print(f"Offline ReID Warning: Cannot merge {remove_id} into {keep_id}. One or both galleries missing (perhaps already merged?).")
+                 continue
+
             # Merge feature galleries
-            if remove_id in self.feature_gallery:
-                features_to_add = list(self.feature_gallery[remove_id])
-                for feature in features_to_add:
-                     if isinstance(feature, np.ndarray) and feature.shape == self.feature_gallery[keep_id][0].shape:
-                         self.feature_gallery[keep_id].append(feature) # Add features to the kept ID
+            features_to_add = self.feature_gallery[remove_id] # deque
+            target_gallery = self.feature_gallery[keep_id] # deque
 
-                # Update last seen frame to the most recent one
-                self.last_seen_frame[keep_id] = max(
-                    self.last_seen_frame.get(keep_id, 0),
-                    self.last_seen_frame.get(remove_id, 0)
-                )
+            target_feature_shape = None
+            for f in target_gallery:
+                 if isinstance(f, np.ndarray):
+                     target_feature_shape = f.shape
+                     break
+            if target_feature_shape is None and features_to_add:
+                 # If target is empty, try to get shape from source
+                 for f in features_to_add:
+                      if isinstance(f, np.ndarray):
+                           target_feature_shape = f.shape
+                           break
 
-                # Remove the merged ID data
-                del self.feature_gallery[remove_id]
-                if remove_id in self.last_seen_frame: del self.last_seen_frame[remove_id]
-                if remove_id in self.inactive_ids: self.inactive_ids.remove(remove_id)
-                if remove_id in self.track_history: del self.track_history[remove_id]
-                if remove_id in self.kalman_predictions: del self.kalman_predictions[remove_id]
+            added_count = 0
+            for feature in list(features_to_add): # Iterate over a copy
+                 if isinstance(feature, np.ndarray) and (target_feature_shape is None or feature.shape == target_feature_shape):
+                     target_gallery.append(feature)
+                     added_count += 1
+            # print(f"Merged {added_count} features from {remove_id} to {keep_id}")
 
+            # Update last seen frame
+            self.last_seen_frame[keep_id] = max(
+                self.last_seen_frame.get(keep_id, 0),
+                self.last_seen_frame.get(remove_id, 0)
+            )
 
-            # Update ID mapping for any DeepSORT tracks still mapped to the removed ID
-            # This handles cases where a track reappears just before the merge happens
+            # Remove the merged ID data cleanly
+            del self.feature_gallery[remove_id]
+            if remove_id in self.last_seen_frame: del self.last_seen_frame[remove_id]
+            # Use discard() for sets, it doesn't raise an error if the element is not present
+            self.inactive_ids.discard(remove_id)
+            if remove_id in self.track_history: del self.track_history[remove_id]
+            if remove_id in self.kalman_predictions: del self.kalman_predictions[remove_id]
+
+            # Update ID mapping
+            updated_mapping_count = 0
             for track_id, consistent_id in list(self.id_mapping.items()):
                 if consistent_id == remove_id:
                     self.id_mapping[track_id] = keep_id
+                    updated_mapping_count += 1
+            # if updated_mapping_count > 0: print(f"Updated id_mapping for {updated_mapping_count} track(s) from {remove_id} to {keep_id}")
+
+            # Ensure kept ID is not marked inactive
+            self.inactive_ids.discard(keep_id)
+            # print(f"Offline ReID: Ensured {keep_id} is not in inactive_ids.")
+
+        # print("Offline ReID: Finished.")
     
     def _update_motion_predictions(self):
         """
         Update motion predictions for all tracks
         This helps with re-identifying objects after they reappear
         """
+        # Group all position histories
+        all_tracks = []
+        track_ids = []
+
         for consistent_id, positions in self.track_history.items():
-            if len(positions) < 2:
+            if len(positions) >= 2:
+                all_tracks.append(list(positions)[-5:])  # Take last 5 positions
+                track_ids.append(consistent_id)
+
+        if not all_tracks:
+            return
+
+        # Convert to tensors
+        track_tensors = [torch.tensor(track, dtype=torch.float32).cuda() for track in all_tracks]
+
+        # Process each track in parallel using GPU
+        for i, (track_tensor, consistent_id) in enumerate(zip(track_tensors, track_ids)):
+            if len(track_tensor) < 2:
                 continue
-            
-            # Get the last few positions
-            recent_positions = list(positions)[-5:]
-            
-            if len(recent_positions) < 2:
-                continue
-            
-            # Calculate velocity based on recent positions
-            velocities = []
-            for i in range(1, len(recent_positions)):
-                prev_x, prev_y = recent_positions[i-1]
-                curr_x, curr_y = recent_positions[i]
-                velocities.append((curr_x - prev_x, curr_y - prev_y))
-            
-            # Average velocity
-            avg_vx = np.mean([v[0] for v in velocities])
-            avg_vy = np.mean([v[1] for v in velocities])
-            
+
+            # Calculate velocity using tensor operations
+            velocity = track_tensor[1:] - track_tensor[:-1]
+            avg_velocity = torch.mean(velocity, dim=0)
+
             # Predict next position
-            last_x, last_y = recent_positions[-1]
-            pred_x = last_x + avg_vx
-            pred_y = last_y + avg_vy
-            
+            last_pos = track_tensor[-1]
+            pred_pos = last_pos + avg_velocity
+
             # Store prediction
-            self.kalman_predictions[consistent_id] = (pred_x, pred_y)
+            self.kalman_predictions[consistent_id] = (
+                pred_pos[0].item(), 
+                pred_pos[1].item()
+            )
 
 
 # Example integration with YOLO object detector
@@ -591,6 +843,7 @@ class YOLODetector:
         self.conf_threshold = conf_threshold
         self.classes = classes  # None means detect all classes
     
+    @profile_function
     def detect(self, frame):
         """
         Detect objects in the frame
@@ -790,7 +1043,7 @@ def main():
     print(f"Setting DeepSORT max_age to {final_max_age} frames for ~{target_occlusion_seconds}s occlusion at {fps:.2f} FPS.")
     
     tracker = HybridTracker(
-        max_cosine_distance=0.6,  # Keep or slightly increase (e.g., 0.5) if needed
+        max_cosine_distance=0.3,  # Keep or slightly increase (e.g., 0.5) if needed
         nn_budget=1000,            # Keep or increase if memory allows and needed
         max_age=final_max_age,    # <--- Key change: Increased max_age
         min_confidence=0.3,
@@ -879,7 +1132,82 @@ def main():
     if video_writer is not None:
         video_writer.release()
     cv2.destroyAllWindows()
+    
+    # Stop profiling and display results
+    profiler.disable()
+    
+    # Save detailed profiling stats to a file
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stats_file = f"profiling_stats_{timestamp}.prof"
+    profiler.dump_stats(stats_file)
+    print(f"\nDetailed profiling stats saved to: {stats_file}")
+    print("You can analyze this file with tools like snakeviz or using Python's pstats module")
+    
+    # Display basic profiling stats
+    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    print("\n===== TOP 20 TIME-CONSUMING FUNCTIONS =====")
+    stats.print_stats(20)
+    
+    # Display our custom performance metrics
+    display_profiling_stats()
 
+# Add this new function specifically for resizing input frames while preserving aspect ratio
+def resize_with_aspect_ratio(image, width=None, height=None):
+    """
+    Resize image to target width or height while preserving aspect ratio
+    
+    Args:
+        image: Input image
+        width: Target width (if None, calculate from height)
+        height: Target height (if None, calculate from width)
+        
+    Returns:
+        Resized image
+    """
+    h, w = image.shape[:2]
+    
+    # Both width and height are None, return original image
+    if width is None and height is None:
+        return image
+    
+    # Both are specified, determine which one to follow based on aspect ratio
+    if width is not None and height is not None:
+        # Calculate target aspect ratio
+        target_ratio = width / height
+        # Calculate current aspect ratio
+        current_ratio = w / h
+        
+        # If current ratio is wider than target, use width as the limiting factor
+        if current_ratio > target_ratio:
+            height = None
+        # Otherwise use height as the limiting factor
+        else:
+            width = None
+    
+    # Calculate new dimensions
+    if width is None:
+        # Target height is specified, calculate width to maintain aspect ratio
+        r = height / h
+        new_width = int(w * r)
+        new_height = height
+    else:
+        # Target width is specified, calculate height to maintain aspect ratio
+        r = width / w
+        new_width = width
+        new_height = int(h * r)
+    
+    # Resize image
+    resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return resized
+
+def signal_handler(sig, frame):
+    print("\nCtrl+C detected. Exiting gracefully...")
+    # Use the global profiling stats instead
+    display_profiling_stats()
+    exit(0)
+
+# Register signal handler for Ctrl+C
+signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == "__main__":
     main()
