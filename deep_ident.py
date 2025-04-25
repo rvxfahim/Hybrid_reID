@@ -547,7 +547,8 @@ class HybridTracker:
 
 # Example integration with YOLO object detector
 class YOLODetector:
-    def __init__(self, model_path=None, conf_threshold=0.25, classes=None):
+    def __init__(self, model_path=None, conf_threshold=0.25, classes=None, device='cuda'):
+        self.device = device
         """
         Initialize YOLO detector
         
@@ -556,21 +557,21 @@ class YOLODetector:
             conf_threshold: Confidence threshold
             classes: List of classes to detect
         """
-        # Use YOLO from ultralytics if available
         try:
             from ultralytics import YOLO
             
+            # Change the default model to YOLOv11
             if model_path is None:
-                self.model = YOLO("yolov8n.pt")  # Use default YOLOv8 nano model
+                self.model = YOLO("yolo11s.pt").to(self.device)  # Use YOLOv11 nano model with device
             else:
-                self.model = YOLO(model_path)
+                self.model = YOLO(model_path).to(self.device)
                 
             self.using_ultralytics = True
-            print("Using YOLO from ultralytics")
+            print(f"Using YOLOv11 from ultralytics")
             
         except ImportError:
             print("Ultralytics YOLO not available, using OpenCV DNN module")
-            # Fall back to OpenCV DNN
+            # Fall back to OpenCV DNN (note: this fallback won't support YOLOv11)
             self.model = cv2.dnn.readNetFromDarknet(
                 os.path.join("yolo", "yolov4.cfg"),
                 os.path.join("yolo", "yolov4.weights")
@@ -584,6 +585,8 @@ class YOLODetector:
             # Load COCO class names
             with open(os.path.join("yolo", "coco.names"), "r") as f:
                 self.classes = f.read().strip().split("\n")
+            
+            print("Warning: Fallback mode does not support YOLOv11")
         
         self.conf_threshold = conf_threshold
         self.classes = classes  # None means detect all classes
@@ -600,7 +603,7 @@ class YOLODetector:
         """
         if self.using_ultralytics:
             # Use YOLO from ultralytics
-            results = self.model(frame)
+            results = self.model(frame, device=self.device)  # Explicitly set device
             
             # Process detections
             detections = []
@@ -664,6 +667,33 @@ class YOLODetector:
             
             return detections
 
+def resize_for_display(image, max_width=1280, max_height=720):
+    """
+    Resize image to fit within specified dimensions while preserving aspect ratio
+    
+    Args:
+        image: Input image
+        max_width: Maximum display width
+        max_height: Maximum display height
+        
+    Returns:
+        Resized image for display
+    """
+    h, w = image.shape[:2]
+    
+    # Calculate scale factor to fit within max dimensions
+    scale_w = max_width / w
+    scale_h = max_height / h
+    scale = min(scale_w, scale_h)
+    
+    # Only resize if image is larger than max dimensions
+    if scale < 1:
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return resized
+    
+    # Return original if already smaller than max dimensions
+    return image
 
 def main():
     """
@@ -695,7 +725,9 @@ def main():
      
     # Initialize object detector
     try:
-        detector = YOLODetector(conf_threshold=0.3, classes=[0])  # 0 is person in COCO
+        detector = YOLODetector(conf_threshold=0.3, classes=[0], device='cuda')
+        # Option 2: If you have a specific YOLOv11 model file, specify it
+        # detector = YOLODetector(model_path="path/to/yolov11n.pt", conf_threshold=0.3, classes=[0])
     except Exception as e:
         print(f"Error initializing YOLO detector: {e}")
         print("Falling back to mock detector")
@@ -758,12 +790,12 @@ def main():
     print(f"Setting DeepSORT max_age to {final_max_age} frames for ~{target_occlusion_seconds}s occlusion at {fps:.2f} FPS.")
     
     tracker = HybridTracker(
-        max_cosine_distance=0.4,  # Keep or slightly increase (e.g., 0.5) if needed
-        nn_budget=100,            # Keep or increase if memory allows and needed
+        max_cosine_distance=0.6,  # Keep or slightly increase (e.g., 0.5) if needed
+        nn_budget=1000,            # Keep or increase if memory allows and needed
         max_age=final_max_age,    # <--- Key change: Increased max_age
         min_confidence=0.3,
-        re_id_interval=30,        # Adjust interval if needed (e.g., 30 frames)
-        gallery_size=100          # Keep or increase if needed
+        re_id_interval=5,        # Adjust interval if needed (e.g., 30 frames)
+        gallery_size=1000          # Keep or increase if needed
     )
     
     # Colors for visualization
@@ -796,24 +828,24 @@ def main():
                 colors[track_id] = tuple(np.random.randint(0, 255, 3).tolist())
             color = colors[track_id]
             
-            # Draw bounding box
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            # Draw bounding box - increased line width from 2 to 3
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
             
-            # Draw ID
+            # Draw ID - increased font scale from 0.5 to 0.9 and text position adjusted
             text = f"ID: {int(track_id)}"
-            cv2.putText(frame, text, (int(x1), int(y1)-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.putText(frame, text, (int(x1), int(y1)-15), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
             
-            # Draw track trail
+            # Draw track trail - increased line width from 2 to 3
             if track_id in tracker.track_history:
                 points = list(tracker.track_history[track_id])
                 for i in range(1, len(points)):
                     cv2.line(frame, (int(points[i-1][0]), int(points[i-1][1])),
-                             (int(points[i][0]), int(points[i][1])), color, 2)
+                             (int(points[i][0]), int(points[i][1])), color, 3)
         
-        # Draw frame count
+        # Draw frame count - increased font size from 0.7 to 0.9
         cv2.putText(frame, f"Frame: {frame_count}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         
         # Initialize video writer on first frame if saving
         if save_video and video_writer is None:
@@ -825,8 +857,14 @@ def main():
         if save_video and video_writer is not None:
             video_writer.write(frame)
         
-        # Display frame
-        cv2.imshow("Hybrid Tracking", frame)
+        # Resize frame for display only (processing still uses original resolution)
+        display_frame = resize_for_display(frame, max_width=1280, max_height=720)
+
+        # Display the resized frame
+        cv2.imshow("Hybrid Tracking", display_frame)
+
+        # Add this line to make the window resizable by the user if needed
+        cv2.namedWindow("Hybrid Tracking", cv2.WINDOW_NORMAL)
         
         # Break on 'q' key
         key = cv2.waitKey(1) & 0xFF
