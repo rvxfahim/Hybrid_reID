@@ -14,6 +14,7 @@ import torch
 import torchvision
 from torchvision.transforms import transforms
 from torchvision.models import ResNet50_Weights
+import torch.nn.functional as F
 import time
 import os
 import signal
@@ -135,37 +136,36 @@ def display_profiling_stats():
 class FeatureExtractor:
     def __init__(self, model_path=None, device='cuda' if torch.cuda.is_available() else 'cpu'):
         """
-        Initialize the feature extractor with a pre-trained model
-        
+        Initialize the feature extractor with DINOv2 model
+
         Args:
-            model_path: Path to the pre-trained model (if None, use a pre-trained ResNet50)
+            model_path: Path to a custom model (if None, use pre-trained DINOv2)
             device: Device to run the model on ('cuda' or 'cpu')
         """
         self.device = device
         print(f"Using device: {self.device}")
-        
-        # Initialize model - ResNet50 is commonly used for ReID tasks
+
+        # Initialize DINOv2 model
         if model_path is None or not os.path.exists(model_path):
-            print("Loading pre-trained ResNet50 model")
-            self.model = torchvision.models.resnet50(weights=ResNet50_Weights.DEFAULT)
-            # Remove the final FC layer to get feature vectors
-            self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
+            print("Loading pre-trained DINOv2 ViT-S/14 model")
+            self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
         else:
-            print(f"Loading model from {model_path}")
+            print(f"Loading custom model from {model_path}")
             self.model = torch.load(model_path, map_location=self.device)
-        
+
         self.model = self.model.to(self.device)
         self.model.eval()
-        
-        # Define image transforms
+
+        # Define image transforms for DINOv2
         self.transform = transforms.Compose([
-            transforms.Resize((256, 128)),  # Standard size for ReID
+            transforms.Resize(256),
+            transforms.CenterCrop(224),  # DINOv2 expects 224x224 input
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+
+        self.feature_dim = 768  # DINOv2 ViT-B/14 output dimension
         
-        self.feature_dim = 2048  # ResNet50 feature dimension
-    
     @profile_function
     def extract_features_batch(self, frame, bboxes):
         """
@@ -213,18 +213,15 @@ class FeatureExtractor:
         # Stack crops into a batch tensor
         batch = torch.stack(crops).to(self.device)
         
-        # Extract features in a single forward pass
+        # Extract features with DINOv2 in a single forward pass
         with torch.no_grad():
             features_batch = self.model(batch)
-            features_batch = features_batch.squeeze().cpu().numpy()
+            features_batch = F.normalize(features_batch, p=2, dim=1).cpu().numpy()
             
         # If only one crop, ensure we have correct dimensions
         if len(crops) == 1:
             features_batch = features_batch.reshape(1, -1)
             
-        # Normalize feature vectors
-        features_batch = features_batch / np.linalg.norm(features_batch, axis=1, keepdims=True)
-        
         # Create result array with zeros for invalid bboxes
         result = [np.zeros(self.feature_dim, dtype=np.float32)] * len(bboxes)
         for i, valid_idx in enumerate(valid_indices):
@@ -244,24 +241,25 @@ def compute_cosine_distance_gpu(features1, features2, threshold=1.0):
     """
     if len(features1) == 0 or len(features2) == 0:
         return np.array([])
+        
     # Convert to PyTorch tensors and move to GPU
     features1_tensor = torch.tensor(features1, dtype=torch.float32).cuda()
     features2_tensor = torch.tensor(features2, dtype=torch.float32).cuda()
-    # Normalize on GPU if needed
-    f1_norm = torch.norm(features1_tensor, dim=1, keepdim=True)
-    f2_norm = torch.norm(features2_tensor, dim=1, keepdim=True)
-    # Avoid division by zero
-    f1_norm = torch.where(f1_norm == 0, torch.ones_like(f1_norm), f1_norm)
-    f2_norm = torch.where(f2_norm == 0, torch.ones_like(f2_norm), f2_norm)
-    features1_normalized = features1_tensor / f1_norm
-    features2_normalized = features2_tensor / f2_norm
+    
+    # Ensure features are normalized (DINOv2 features should already be normalized)
+    features1_norm = F.normalize(features1_tensor, p=2, dim=1)
+    features2_norm = F.normalize(features2_tensor, p=2, dim=1)
+    
     # Calculate cosine similarity matrix: (a·b)/(|a|·|b|)
-    similarity = torch.mm(features1_normalized, features2_normalized.t())
+    similarity = torch.mm(features1_norm, features2_norm.t())
+    
     # Convert to distance: 1 - similarity
     distance = 1.0 - similarity
+    
     # Apply threshold if needed
     if threshold < 1.0:
         distance = torch.clamp(distance, 0.0, threshold)
+        
     # Return as numpy array
     return distance.cpu().numpy()
     
@@ -650,7 +648,7 @@ class HybridTracker:
 
         # --- 3. Extract Minimums and Build Merge Candidates ---
         merge_candidates = []
-        merge_threshold = 0.3 # Your similarity threshold (applied AFTER distance calculation)
+        merge_threshold = 0.2 # Your similarity threshold (applied AFTER distance calculation)
 
         for id1 in valid_active_ids: # Iterate through ACTIVE track IDs that had features
             indices1 = active_feature_indices.get(id1) # Use .get for safety
@@ -953,7 +951,7 @@ def main():
     Main function to demonstrate the hybrid tracker
     """
     # Initialize video capture
-    video_path = "video.mp4"  # Change to your video path
+    video_path = "video2.mp4"  # Change to your video path
     if not os.path.exists(video_path):
         print(f"Video file {video_path} does not exist. Using webcam instead.")
         cap = cv2.VideoCapture(0)
@@ -1043,12 +1041,13 @@ def main():
     print(f"Setting DeepSORT max_age to {final_max_age} frames for ~{target_occlusion_seconds}s occlusion at {fps:.2f} FPS.")
     
     tracker = HybridTracker(
-        max_cosine_distance=0.3,  # Keep or slightly increase (e.g., 0.5) if needed
-        nn_budget=1000,            # Keep or increase if memory allows and needed
-        max_age=final_max_age,    # <--- Key change: Increased max_age
+        max_cosine_distance=0.25,      # Reduced threshold for DINOv2 features
+        nn_budget=1000,                # Keep or increase if memory allows
+        max_age=final_max_age,         # Keep dynamically calculated max_age
         min_confidence=0.3,
-        re_id_interval=5,        # Adjust interval if needed (e.g., 30 frames)
-        gallery_size=1000          # Keep or increase if needed
+        re_id_interval=5,              # Set to run re-ID frequently since DINOv2 is powerful
+        gallery_size=1000,             # Keep or increase if needed
+        iou_threshold=0.4              # You might need to adjust this based on testing
     )
     
     # Colors for visualization
