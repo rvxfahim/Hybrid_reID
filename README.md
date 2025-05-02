@@ -36,7 +36,9 @@ For each detected object, we extract a unique visual signature using DINOv2 ViT-
 3. **Extract** a 768-dimensional feature vector using DINOv2
 4. **Normalize** the vector to unit length (L2 normalization): 
    
-   ![f_{normalized} = \frac{f}{||f||_2} = \frac{f}{\sqrt{f_1^2 + f_2^2 + ... + f_{768}^2}}](https://latex.codecogs.com/svg.latex?f_%7Bnormalized%7D%20%3D%20%5Cfrac%7Bf%7D%7B%7C%7Cf%7C%7C_2%7D%20%3D%20%5Cfrac%7Bf%7D%7B%5Csqrt%7Bf_1%5E2%20%2B%20f_2%5E2%20%2B%20...%20%2B%20f_%7B768%7D%5E2%7D%7D)
+```math
+f_{normalized} = \frac{f}{||f||_2} = \frac{f}{\sqrt{f_1^2 + f_2^2 + \dots + f_{768}^2}}
+```
 
 This transforms each object into a compact "visual fingerprint" that captures its appearance while being robust to small changes in lighting, pose, or viewpoint.
 
