@@ -5,7 +5,6 @@ This implementation demonstrates a hybrid tracking approach that:
 1. Uses DeepSORT for short-term, frame-to-frame tracking
 2. Incorporates an offline re-identification system to maintain consistent IDs
 3. Implements temporal association refinements for improved tracking across occlusions
-4. Uses a ResNet50-based feature extractor for appearance embedding
 """
 
 import cv2
@@ -146,13 +145,27 @@ class FeatureExtractor:
         print(f"Using device: {self.device}")
 
         # Initialize DINOv2 model
-        if model_path is None or not os.path.exists(model_path):
-            print("Loading pre-trained DINOv2 ViT-S/14 model")
-            self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
-        else:
-            print(f"Loading custom model from {model_path}")
-            self.model = torch.load(model_path, map_location=self.device)
-
+        try:
+            if (model_path is None or not os.path.exists(model_path)):
+                print("Loading pre-trained DINOv2 ViT-S/14 model")
+                self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
+                self.feature_dim = 768   # ViT-S/14 output dimension
+            else:
+                print(f"Loading custom model from {model_path}")
+                self.model = torch.load(model_path, map_location=self.device)
+                # Attempt to determine feature dim from model if not specified
+                if hasattr(self.model, 'embed_dim'):
+                    self.feature_dim = self.model.embed_dim
+                else:
+                    self.feature_dim = 384  # Default to ViT-S/14 dimension
+        except Exception as e:
+            print(f"Error loading DINOv2 model: {e}")
+            # Fall back to a simpler ResNet model if DINOv2 fails
+            print("Falling back to ResNet50 model")
+            self.model = torchvision.models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+            self.model = torch.nn.Sequential(*list(self.model.children())[:-1])  # Remove classification layer
+            self.feature_dim = 2048  # ResNet50 feature dimension
+        
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -164,7 +177,7 @@ class FeatureExtractor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-        self.feature_dim = 768  # DINOv2 ViT-B/14 output dimension
+        print(f"Feature extractor initialized with feature dimension: {self.feature_dim}")
         
     @profile_function
     def extract_features_batch(self, frame, bboxes):
@@ -314,6 +327,12 @@ class HybridTracker:
         self.kalman_predictions = {}  # {consistent_id: predicted next position}
         
         print("Hybrid tracker initialized with DeepSORT and Re-ID components")
+        
+        # Add a flag to identify the primary object of interest
+        self.primary_object_id = None  # Will be set to 1 after first frame
+        self.primary_object_features = deque(maxlen=gallery_size)  # Store features of primary object only
+        self.primary_object_last_seen = 0  # Last frame where primary object was seen
+        self.primary_object_active = False  # Whether the primary object is currently being tracked
     
     def update_feature_galleries_batch(self, frame, tracks):
         """Update feature galleries for multiple tracks in a single GPU operation"""
@@ -340,224 +359,206 @@ class HybridTracker:
         
     @profile_function
     def update(self, frame, detections):
-        """
-        Update the tracker with new detections
-
-        Args:
-            frame: Current video frame
-            detections: List of detections as [x1, y1, x2, y2, confidence, class_id]
-
-        Returns:
-            List of tracks as [x1, y1, x2, y2, consistent_id, class_id]
-        """
+        """Optimized update method focusing on primary object (ID1)"""
         self.frame_count += 1
 
-        # 1. Format detections for DeepSORT (LTWH format expected)
-        formatted_detections = []
-        original_bboxes_ltrb = [] # Keep original LTRB for potential feature extraction later if needed
+        # Format detections for DeepSORT
+        deepsort_detections = []
 
-        for i, det in enumerate(detections):
+        for det in detections:
             if len(det) >= 6:
-                bbox_ltrb = det[:4]  # [x1, y1, x2, y2]
-                confidence = det[4]
-                class_id = int(det[5]) # You might need to map this to a class name string depending on DeepSORT setup
-
+                bbox, confidence, class_id = det[:4], det[4], det[5]
                 if confidence < self.min_confidence:
                     continue
 
-                # Convert LTRB to LTWH (Left, Top, Width, Height)
-                x1, y1, x2, y2 = bbox_ltrb
-                w = x2 - x1
-                h = y2 - y1
+                # Convert to [x1, y1, w, h] format for DeepSORT
+                x1, y1, x2, y2 = bbox
+                w, h = x2 - x1, y2 - y1
 
-                # Ensure width and height are positive
-                if w <= 0 or h <= 0:
-                    # print(f"Skipping detection with non-positive width/height: {bbox_ltrb}")
-                    continue
+                # Extract features
+                feature = self.feature_extractor.extract_features_batch(frame, [bbox])[0]
 
-                bbox_ltwh = [x1, y1, w, h]
+                # Create detection tuple in the format expected by deep_sort_realtime
+                deepsort_detection = ([x1, y1, w, h], confidence, feature)
+                deepsort_detections.append(deepsort_detection)
 
-                # Append in the format expected by deep_sort_realtime: (bbox_ltwh, confidence, class_id)
-                # Note: We are NOT passing our custom features here. DeepSORT will use its own internal
-                # feature extractor based on its configuration.
-                formatted_detections.append((bbox_ltwh, confidence, class_id))
-                original_bboxes_ltrb.append(bbox_ltrb) # Store original format if needed
-            else:
-                 print(f"Warning: Detection has unexpected format: {det}")
+        # Update DeepSORT tracker with correctly formatted detections
+        deepsort_tracks_returned = self.tracker.update_tracks(deepsort_detections, frame=frame)
 
-
-        # 2. Update DeepSORT tracker
-        # It expects [( [x,y,w,h], conf, class_id ), ... ]
-        # It returns track objects.
-        # Note: The `frame` argument might be used internally by DeepSORT for feature extraction.
-        deepsort_tracks_returned = self.tracker.update_tracks(formatted_detections, frame=frame)
-
-        # 3. Process DeepSORT tracks and map to consistent IDs
+        # Process DeepSORT tracks
         current_tracks = []
-        current_active_ids = set()
+        primary_object_seen = False
 
-        # Iterate through the tracks returned by DeepSORT
-        # These are usually Track objects from the library.
+        # Initialize primary_object_bbox if not already set
+        if not hasattr(self, 'primary_object_bbox'):
+            self.primary_object_bbox = None
+
         for track_object in deepsort_tracks_returned:
-            # Check if the track object is valid and confirmed
-            # Note: The exact conditions might vary slightly based on deep_sort_realtime version.
-            # Common checks: is_confirmed(), time_since_update
             if not track_object.is_confirmed() or track_object.time_since_update > 1:
                 continue
 
-            track_id = track_object.track_id # This is the temporary DeepSORT ID
-            bbox_ltrb = track_object.to_ltrb() # Get LTRB bbox [x1, y1, x2, y2]
+            track_id = track_object.track_id  # DeepSORT temporary ID
+            bbox_ltrb = track_object.to_ltrb()
 
-            # Retrieve the *most recent feature* associated with this track by DeepSORT's internal extractor
-            current_feature = None
-            if track_object.features:
-                 # Ensure features list is not empty and contains numpy arrays
-                 if isinstance(track_object.features[-1], np.ndarray):
-                    current_feature = track_object.features[-1]
-
-            # If DeepSORT didn't provide a feature (e.g., config issue, or just Kalman update),
-            # we might need to extract it ourselves using the final bbox.
-            # However, mixing features from different extractors can be problematic.
-            # It's best to rely on DeepSORT's features if possible.
+            # Get feature from track (either from DeepSORT or extract it)
+            current_feature = self._get_feature_from_track(frame, track_object, bbox_ltrb)
             if current_feature is None:
-                 # print(f"Warning: Track {track_id} from DeepSORT has no valid features. Attempting manual extraction.")
-                 # Ensure bbox is valid before extraction
-                 if bbox_ltrb[2] > bbox_ltrb[0] and bbox_ltrb[3] > bbox_ltrb[1]:
-                     current_feature = self.feature_extractor.extract_features(frame, bbox_ltrb)
-                     if np.all(current_feature == 0): # Check if extraction failed
-                         # print(f"Manual feature extraction failed for track {track_id}.")
-                         current_feature = None # Reset to None if failed
-                 else:
-                     # print(f"Skipping feature extraction for track {track_id} due to invalid bbox: {bbox_ltrb}")
-                     current_feature = None
+                continue
 
-            if current_feature is None:
-                # print(f"Skipping track {track_id} due to missing feature.")
-                continue # Skip this track if we couldn't get a feature
-
-
-            # --- ID mapping and Re-ID logic (using the feature obtained above) ---
+            # Handle ID mapping
             if track_id not in self.id_mapping:
-                # Pass the feature obtained (either from DeepSORT or manually extracted)
-                matched_id = self._re_identify_object(frame, bbox_ltrb, current_feature)
-
-                if matched_id is not None:
-                    self.id_mapping[track_id] = matched_id
-                    # print(f"Re-identified object with ID {matched_id}") # Optional logging
+                # First frame - assign ID1 to first detected object 
+                if self.primary_object_id is None:
+                    self.primary_object_id = 1
+                    self.id_mapping[track_id] = self.primary_object_id
+                    self.primary_object_active = True
+                    print(f"Initialized primary object with ID {self.primary_object_id}")
                 else:
-                    self.id_mapping[track_id] = self.next_id
-                    self.next_id += 1
+                    # For subsequent new objects, check if this could be the primary object returning
+                    if not self.primary_object_active and self.primary_object_features:
+                        # Only try to re-identify against the primary object
+                        if self._is_primary_object(current_feature, bbox_ltrb):  # Add bbox parameter here
+                            self.id_mapping[track_id] = self.primary_object_id
+                            self.primary_object_active = True
+                            print(f"Re-identified primary object with ID {self.primary_object_id}")
+                        else:
+                            # Assign a new ID for other objects
+                            self.id_mapping[track_id] = self.next_id
+                            self.next_id += 1
+                    else:
+                        # Assign a new ID for other objects
+                        self.id_mapping[track_id] = self.next_id
+                        self.next_id += 1
 
             consistent_id = self.id_mapping[track_id]
-            current_active_ids.add(consistent_id)
 
-            # Add position to history
+            # Update track history and tracking info
             center_x = (bbox_ltrb[0] + bbox_ltrb[2]) / 2
             center_y = (bbox_ltrb[1] + bbox_ltrb[3]) / 2
             self.track_history[consistent_id].append((center_x, center_y))
 
-            self.last_seen_frame[consistent_id] = self.frame_count
+            # For the primary object, update its features and perform additional IoU check
+            if consistent_id == self.primary_object_id:
+                # If we have a previous bbox for the primary object, check IoU to ensure consistency
+                if self.primary_object_active and self.primary_object_bbox is not None:
+                    iou = self._calculate_iou(bbox_ltrb, self.primary_object_bbox)
+                    # If IoU is too low, either this is not the primary object or it moved very fast
+                    # Only accept if the IoU is good enough OR we haven't seen the primary object for a while
+                    frames_since_last_seen = self.frame_count - self.primary_object_last_seen
+                    if iou < self.iou_threshold and frames_since_last_seen <= 5:  # Only check for recent frames
+                        print(f"Warning: Rejecting assignment to primary object due to low IoU: {iou:.3f}")
+                        # Create a new ID instead
+                        new_id = self.next_id
+                        self.next_id += 1
+                        self.id_mapping[track_id] = new_id
+                        consistent_id = new_id
+                    else:
+                        # Update primary object information
+                        if not hasattr(self, 'primary_object_features'):
+                            self.primary_object_features = deque(maxlen=self.gallery_size)
+                        self.primary_object_features.append(current_feature)
+                        self.primary_object_last_seen = self.frame_count
+                        self.primary_object_active = True
+                        primary_object_seen = True
 
-            if consistent_id in self.inactive_ids:
-                self.inactive_ids.remove(consistent_id)
+                        # Store this bbox for the primary object
+                        self.primary_object_bbox = bbox_ltrb
+                else:
+                    # No previous bbox, update primary object information
+                    if not hasattr(self, 'primary_object_features'):
+                        self.primary_object_features = deque(maxlen=self.gallery_size)
+                    self.primary_object_features.append(current_feature)
+                    self.primary_object_last_seen = self.frame_count
+                    self.primary_object_active = True
+                    primary_object_seen = True
 
-            # Retrieve class_id associated with the track by DeepSORT
-            # The attribute name might be `det_class`, `cls`, etc. Check library source/docs if needed.
-            # Default to 0 or a placeholder if not available.
-            track_class_id = track_object.get_det_class() if hasattr(track_object, 'get_det_class') else (track_object.det_class if hasattr(track_object, 'det_class') else 0)
+                    # Store this bbox for the primary object
+                    self.primary_object_bbox = bbox_ltrb
 
+            # Get class ID from track
+            track_class_id = track_object.get_det_class() if hasattr(track_object, 'get_det_class') else \
+                            (track_object.det_class if hasattr(track_object, 'det_class') else 0)
 
-            current_tracks.append([*bbox_ltrb, consistent_id, track_class_id]) # Use LTRB and consistent ID
+            current_tracks.append([*bbox_ltrb, consistent_id, track_class_id])
 
-        # Add batch update right after tracks are processed, before re-ID
+        # Update primary object status if not seen in this frame
+        if not primary_object_seen:
+            self.primary_object_active = False
+
+        # Only update motion predictions for the primary object
+        if self.primary_object_id in self.track_history:
+            self._update_primary_motion_prediction()
+
+        # Update feature galleries
         self.update_feature_galleries_batch(frame, current_tracks)
-    
-        # Run periodic re-identification for long-term tracking
+
+        # Perform offline re-identification at regular intervals
         if self.frame_count % self.re_id_interval == 0:
-            self._perform_offline_reid(frame) # Pass frame if needed by re-id logic, otherwise remove
-
-        # Update inactive IDs
-        # Make a copy of keys to avoid modifying dict while iterating
-        all_known_ids = list(self.last_seen_frame.keys())
-        for consistent_id in all_known_ids:
-            if consistent_id not in current_active_ids:
-                # Only mark as inactive if it was previously active or seen recently
-                 if consistent_id not in self.inactive_ids:
-                    # Add a grace period? E.g., if last seen > N frames ago.
-                    # For now, mark inactive immediately if not currently seen.
-                    self.inactive_ids.add(consistent_id)
-                    # print(f"Object with ID {consistent_id} marked as potentially inactive.") # Optional logging
-
-        # Update motion predictions for temporal association refinement
-        self._update_motion_predictions()
+            self._perform_offline_reid(frame)
 
         return current_tracks
 
     # --- Make sure _re_identify_object uses the features correctly ---
     def _re_identify_object(self, frame, bbox, current_features):
-        """
-        Try to re-identify an object with any of the inactive IDs
-        Args:
-            frame: Current video frame (may not be needed if only using features)
-            bbox: Bounding box as [x1, y1, x2, y2] (may not be needed if only using features)
-            current_features: Features of the current detection (numpy array)
-        Returns:
-            Matched ID or None
-        """
-        # Ensure current_features is a valid numpy array and not all zeros
+        """Re-identify object with additional spatial constraint"""
         if not isinstance(current_features, np.ndarray) or np.all(current_features == 0) or len(self.inactive_ids) == 0:
             return None
-    
-        # Check feature dimension consistency
-        expected_dim = self.feature_extractor.feature_dim  # Usually 2048 for ResNet50
-        if current_features.shape[-1] != expected_dim:
-            print(f"Warning: Feature dimension mismatch. Expected {expected_dim}, got {current_features.shape[-1]}.")
-            # Extract features ourselves instead of using potentially incompatible ones
-            current_features = self.feature_extractor.extract_features_batch(frame, [bbox])[0]
-            if np.all(current_features == 0):
-                return None
+        
+        # Get current bbox center
+        current_center_x = (bbox[0] + bbox[2]) / 2
+        current_center_y = (bbox[1] + bbox[3]) / 2
         
         best_match_id = None
-        # Use a lower threshold for re-id matching (higher similarity needed)
-        best_match_score = 0.6 # Max allowed cosine distance for re-id (adjust as needed)
+        best_match_score = 0.6  # Threshold for feature distance
+        max_spatial_distance = 200  # Maximum allowed spatial distance in pixels
         
-        all_gallery_features = []
-        gallery_id_map = []
+        # Rest of your existing feature matching code...
         
-        for inactive_id in self.inactive_ids:
-            if inactive_id in self.feature_gallery:
-                gallery = self.feature_gallery[inactive_id]
-                # Add dimension check to filter incompatible features
-                valid_features = [f for f in gallery if isinstance(f, np.ndarray) and f.shape[-1] == expected_dim]
+        # Add spatial constraint check before returning the match
+        if best_match_id is not None:
+            # Get last known position of the matched ID
+            if best_match_id in self.track_history and len(self.track_history[best_match_id]) > 0:
+                last_pos = self.track_history[best_match_id][-1]
+                spatial_dist = np.sqrt((last_pos[0] - current_center_x)**2 + 
+                                      (last_pos[1] - current_center_y)**2)
                 
-                if valid_features:
-                    all_gallery_features.extend(valid_features)
-                    gallery_id_map.extend([inactive_id] * len(valid_features))
+                # Reject match if too far away
+                if spatial_dist > max_spatial_distance:
+                    print(f"Rejecting match with ID {best_match_id} due to large spatial distance: {spatial_dist:.1f}px")
+                    return None
         
-        if not all_gallery_features:
-            return None
-            
-        # Compute distances in one GPU operation
-        distances = compute_cosine_distance_gpu(
-            current_features.reshape(1, -1),
-            np.array(all_gallery_features),
-            threshold=0.6
-        )
-        
-        if distances.size == 0:
-            return None
-            
-        # Find best match
-        min_idx = np.argmin(distances[0])
-        min_distance = distances[0][min_idx]
-        
-        if min_distance < 0.6:  # threshold
-            best_match_id = gallery_id_map[min_idx]
-            return best_match_id
-        
-        return None
+        return best_match_id
 
+    def _calculate_iou(self, box1, box2):
+        """
+        Calculate IoU between two bounding boxes
+        Args:
+            box1, box2: Bounding boxes in format [x1, y1, x2, y2]
+        Returns:
+            IoU value
+        """
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
 
+        # Calculate intersection area
+        x_left = max(x1_1, x1_2)
+        y_top = max(y1_1, y1_2)
+        x_right = min(x2_1, x2_2)
+        y_bottom = min(y2_1, y2_2)
+
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0  # No intersection
+
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+        # Calculate areas of both boxes
+        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+
+        # Calculate IoU
+        iou = intersection_area / float(box1_area + box2_area - intersection_area)
+        return iou
+    
     # --- Make sure _perform_offline_reid uses features correctly ---
     @profile_function
     def _perform_offline_reid(self, frame):
@@ -654,11 +655,44 @@ class HybridTracker:
             indices1 = active_feature_indices.get(id1) # Use .get for safety
             if not indices1: continue
 
+            # Get latest position of active track for spatial check
+            active_track_pos = None
+            if id1 in self.track_history and len(self.track_history[id1]) > 0:
+                active_track_pos = self.track_history[id1][-1]  # Last position (x, y)
+
             for id2 in valid_inactive_ids: # Iterate through INACTIVE track IDs that had features
                 if id1 == id2: continue # Cannot merge with self
 
                 indices2 = inactive_feature_indices.get(id2) # Use .get for safety
                 if not indices2: continue
+
+                # Spatial check - compare last track positions (if available)
+                if active_track_pos and id2 in self.track_history and len(self.track_history[id2]) > 0:
+                    inactive_track_pos = self.track_history[id2][-1]  # Last position
+                    
+                    # Get bounding boxes if available
+                    inactive_bbox = None
+                    for track in self.track_history[id2][-1:]:
+                        if isinstance(track, list) and len(track) >= 4:
+                            inactive_bbox = track[:4]  # [x1, y1, x2, y2]
+                            break
+                    
+                    active_bbox = None
+                    for track in self.track_history[id1][-1:]:
+                        if isinstance(track, list) and len(track) >= 4:
+                            active_bbox = track[:4]  # [x1, y1, x2, y2]
+                            break
+                    
+                    # If we have bounding boxes, calculate IoU
+                    skip_this_pair = False
+                    if inactive_bbox and active_bbox:
+                        iou = self._calculate_iou(inactive_bbox, active_bbox)
+                        # If IoU is too low, skip this pair (objects are spatially too different)
+                        if iou < self.iou_threshold:
+                            skip_this_pair = True
+                    
+                    if skip_this_pair:
+                        continue
 
                 # Efficiently select the sub-matrix corresponding to this pair of IDs
                 try:
@@ -794,30 +828,147 @@ class HybridTracker:
                 pred_pos[1].item()
             )
 
+    def _is_primary_object(self, current_feature, current_bbox=None):
+        """
+        Check if the current feature matches the primary object
 
-# Example integration with YOLO object detector
+        Args:
+            current_feature: Feature vector to check
+            current_bbox: Current bounding box to check spatial consistency
+
+        Returns:
+            True if this is likely the primary object, False otherwise
+        """
+        if not self.primary_object_features:
+            return False
+
+        # Add IoU check if both bboxes are available
+        if current_bbox is not None and self.primary_object_bbox is not None:
+            iou = self._calculate_iou(current_bbox, self.primary_object_bbox)
+
+            # If IoU is extremely low and not much time has passed, reject as primary object
+            frames_since_last_seen = self.frame_count - self.primary_object_last_seen
+            if iou < 0.1 and frames_since_last_seen < 30:  # Adjust thresholds as needed
+                print(f"Rejecting primary object candidate due to very low IoU: {iou:.3f}")
+                return False
+
+        # Convert features to tensors
+        features1 = [current_feature]
+        features2 = list(self.primary_object_features)
+
+        # Use GPU for faster computation
+        features1_tensor = torch.tensor(features1, dtype=torch.float32).cuda()
+        features2_tensor = torch.tensor(features2, dtype=torch.float32).cuda()
+
+        # Normalize features
+        features1_norm = F.normalize(features1_tensor, p=2, dim=1)
+        features2_norm = F.normalize(features2_tensor, p=2, dim=1)
+
+        # Calculate similarity
+        similarity = torch.mm(features1_norm, features2_norm.t())
+
+        # Get max similarity
+        max_sim = torch.max(similarity).item()
+        distance = 1.0 - max_sim
+
+        # Define a stricter threshold for primary object
+        reid_threshold = 0.2  # Lower threshold = more strict matching
+
+        # Check spatial constraint if we have motion prediction
+        if self.primary_object_id in self.kalman_predictions and self.primary_object_bbox is not None:
+            pred_x, pred_y = self.kalman_predictions[self.primary_object_id]
+
+            # Get current bbox center
+            current_x = (current_bbox[0] + current_bbox[2]) / 2
+            current_y = (current_bbox[1] + current_bbox[3]) / 2
+
+            # Calculate spatial distance
+            spatial_dist = np.sqrt((pred_x - current_x)**2 + (pred_y - current_y)**2)
+
+            # If too far away, increase matching threshold
+            if spatial_dist > 200:  # pixels
+                reid_threshold *= 0.75  # Make matching harder if spatially distant
+
+        return distance < reid_threshold
+
+    def _update_primary_motion_prediction(self):
+        """Update motion prediction only for the primary object"""
+        if self.primary_object_id not in self.track_history:
+            return
+            
+        positions = self.track_history[self.primary_object_id]
+        if len(positions) < 2:
+            return
+            
+        # Take last 5 positions
+        recent_positions = list(positions)[-5:]
+        
+        # Convert to tensor
+        track_tensor = torch.tensor(recent_positions, dtype=torch.float32).cuda()
+        
+        # Calculate velocity
+        velocity = track_tensor[1:] - track_tensor[:-1]
+        avg_velocity = torch.mean(velocity, dim=0)
+        
+        # Predict next position
+        last_pos = track_tensor[-1]
+        pred_pos = last_pos + avg_velocity
+        
+        # Store prediction
+        self.kalman_predictions[self.primary_object_id] = (
+            pred_pos[0].item(),
+            pred_pos[1].item()
+        )
+
+    def _get_feature_from_track(self, frame, track_object, bbox_ltrb):
+        """Extract features from track object"""
+        # Try to get feature from DeepSORT first
+        if track_object.features and isinstance(track_object.features[-1], np.ndarray):
+            return track_object.features[-1]
+        
+        # If not available, extract manually
+        if bbox_ltrb[2] > bbox_ltrb[0] and bbox_ltrb[3] > bbox_ltrb[1]:
+            # Extract single feature
+            x1, y1, x2, y2 = map(int, bbox_ltrb)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+                
+            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(crop)
+            img_tensor = self.feature_extractor.transform(img).unsqueeze(0).to(self.feature_extractor.device)
+            
+            with torch.no_grad():
+                feature = self.feature_extractor.model(img_tensor)
+                feature = F.normalize(feature, p=2, dim=1).cpu().numpy()[0]
+                
+            return feature
+        
+        return None
+
+
 class YOLODetector:
-    def __init__(self, model_path=None, conf_threshold=0.25, classes=None, device='cuda'):
+    def __init__(self, model_path=None, conf_threshold=0.25, device='cuda'):
         self.device = device
         """
-        Initialize YOLO detector
+        Initialize YOLO detector specialized for human detection
         
         Args:
             model_path: Path to YOLO model
             conf_threshold: Confidence threshold
-            classes: List of classes to detect
+            device: Computing device ('cuda' or 'cpu')
         """
         try:
             from ultralytics import YOLO
             
             # Change the default model to YOLOv11
             if model_path is None:
-                self.model = YOLO("yolo11s.pt").to(self.device)  # Use YOLOv11 nano model with device
+                self.model = YOLO("yolo11n.pt").to(self.device)  # Use YOLOv11 nano model with device
             else:
                 self.model = YOLO(model_path).to(self.device)
                 
             self.using_ultralytics = True
-            print(f"Using YOLOv11 from ultralytics")
+            print(f"Using YOLOv11 from ultralytics (human detection only)")
             
         except ImportError:
             print("Ultralytics YOLO not available, using OpenCV DNN module")
@@ -839,24 +990,26 @@ class YOLODetector:
             print("Warning: Fallback mode does not support YOLOv11")
         
         self.conf_threshold = conf_threshold
-        self.classes = classes  # None means detect all classes
+        # COCO dataset: class 0 is 'person'
+        self.person_class_id = 0  # Human class ID in COCO dataset
     
     @profile_function
     def detect(self, frame):
         """
-        Detect objects in the frame
+        Detect humans in the frame
         
         Args:
             frame: Input frame
             
         Returns:
-            List of detections as [x1, y1, x2, y2, confidence, class_id]
+            List of human detections as [x1, y1, x2, y2, confidence, class_id]
         """
         if self.using_ultralytics:
-            # Use YOLO from ultralytics
-            results = self.model(frame, device=self.device)  # Explicitly set device
+            # Use YOLO from ultralytics - only detect humans (class 0)
+            # Add class filtering to the model prediction to reduce computation
+            results = self.model(frame, device=self.device, classes=[self.person_class_id])
             
-            # Process detections
+            # Process detections (should only be humans due to class filtering)
             detections = []
             for result in results:
                 boxes = result.boxes
@@ -865,10 +1018,9 @@ class YOLODetector:
                     conf = box.conf[0].item()
                     cls = box.cls[0].item()
                     
-                    # Skip if conf is below threshold or class is not in classes
+                    # Skip if conf is below threshold 
+                    # (class check is redundant here since we filtered in the model call)
                     if conf < self.conf_threshold:
-                        continue
-                    if self.classes is not None and int(cls) not in self.classes:
                         continue
                     
                     detections.append([x1, y1, x2, y2, conf, cls])
@@ -889,7 +1041,7 @@ class YOLODetector:
             # Run forward pass
             outputs = self.model.forward(out_layer_names)
             
-            # Process detections
+            # Process detections - filter for humans only
             detections = []
             for output in outputs:
                 for detection in output:
@@ -897,7 +1049,8 @@ class YOLODetector:
                     class_id = np.argmax(scores)
                     confidence = scores[class_id]
                     
-                    if confidence > self.conf_threshold:
+                    # Only include human detections (class 0 in COCO)
+                    if class_id == self.person_class_id and confidence > self.conf_threshold:
                         # Scale bounding box coordinates to original image size
                         center_x = int(detection[0] * width)
                         center_y = int(detection[1] * height)
@@ -909,10 +1062,6 @@ class YOLODetector:
                         y1 = int(center_y - h/2)
                         x2 = x1 + w
                         y2 = y1 + h
-                        
-                        # Skip if class is not in classes
-                        if self.classes is not None and class_id not in self.classes:
-                            continue
                         
                         detections.append([x1, y1, x2, y2, confidence, class_id])
             
@@ -950,8 +1099,12 @@ def main():
     """
     Main function to demonstrate the hybrid tracker
     """
+    # Initialize the profiler at the top of main
+    profiler = cProfile.Profile()
+    profiler.enable()
+    
     # Initialize video capture
-    video_path = "video2.mp4"  # Change to your video path
+    video_path = "left_view.mp4"  # Change to your video path
     if not os.path.exists(video_path):
         print(f"Video file {video_path} does not exist. Using webcam instead.")
         cap = cv2.VideoCapture(0)
@@ -976,7 +1129,7 @@ def main():
      
     # Initialize object detector
     try:
-        detector = YOLODetector(conf_threshold=0.3, classes=[0], device='cuda')
+        detector = YOLODetector(conf_threshold=0.3, device='cuda')
         # Option 2: If you have a specific YOLOv11 model file, specify it
         # detector = YOLODetector(model_path="path/to/yolov11n.pt", conf_threshold=0.3, classes=[0])
     except Exception as e:
@@ -1029,7 +1182,7 @@ def main():
         detector = type('', (), {'detect': mock_detector})()
     
      # Calculate max_age for 5 seconds
-    target_occlusion_seconds = 5
+    target_occlusion_seconds = 10
     calculated_max_age = int(target_occlusion_seconds * fps)
     # Add a small buffer (e.g., 10-20% or a fixed amount)
     buffer_frames = int(0.1 * calculated_max_age) # 10% buffer
@@ -1041,17 +1194,17 @@ def main():
     print(f"Setting DeepSORT max_age to {final_max_age} frames for ~{target_occlusion_seconds}s occlusion at {fps:.2f} FPS.")
     
     tracker = HybridTracker(
-        max_cosine_distance=0.25,      # Reduced threshold for DINOv2 features
-        nn_budget=1000,                # Keep or increase if memory allows
+        max_cosine_distance=0.15,      # Reduced threshold for DINOv2 features
+        nn_budget=2000,                # Keep or increase if memory allows
         max_age=final_max_age,         # Keep dynamically calculated max_age
         min_confidence=0.3,
-        re_id_interval=5,              # Set to run re-ID frequently since DINOv2 is powerful
-        gallery_size=1000,             # Keep or increase if needed
-        iou_threshold=0.4              # You might need to adjust this based on testing
+        re_id_interval=1,              # Set to run re-ID frequently since DINOv2 is powerful
+        gallery_size=3000,             # Keep or increase if needed
+        iou_threshold=0.1              # You might need to adjust this based on testing
     )
     
-    # Colors for visualization
-    colors = {}
+    # Define color for ID1 (primary object)
+    id1_color = (0, 255, 0)  # Green color for primary object
     
     # Initialize video writer if needed
     save_video = False
@@ -1071,33 +1224,44 @@ def main():
         # Update tracker
         tracks = tracker.update(frame, detections)
         
-        # Visualize tracks
+        # Create a copy for visualization
+        display_frame = frame.copy()
+        
+        # Visualize tracks - only for ID1
         for track in tracks:
             x1, y1, x2, y2, track_id, class_id = track
             
-            # Assign a color to this ID
-            if track_id not in colors:
-                colors[track_id] = tuple(np.random.randint(0, 255, 3).tolist())
-            color = colors[track_id]
-            
-            # Draw bounding box - increased line width from 2 to 3
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
-            
-            # Draw ID - increased font scale from 0.5 to 0.9 and text position adjusted
-            text = f"ID: {int(track_id)}"
-            cv2.putText(frame, text, (int(x1), int(y1)-15), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
-            
-            # Draw track trail - increased line width from 2 to 3
-            if track_id in tracker.track_history:
-                points = list(tracker.track_history[track_id])
-                for i in range(1, len(points)):
-                    cv2.line(frame, (int(points[i-1][0]), int(points[i-1][1])),
-                             (int(points[i][0]), int(points[i][1])), color, 3)
+            # Only display ID 1 (primary object)
+            if track_id == 1:
+                # Draw bounding box with increased line width
+                cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), id1_color, 3)
+                
+                # Draw ID
+                text = f"ID: {int(track_id)}"
+                cv2.putText(display_frame, text, (int(x1), int(y1)-15), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, id1_color, 3)
+                
+                # Draw track trail
+                if track_id in tracker.track_history:
+                    points = list(tracker.track_history[track_id])
+                    for i in range(1, len(points)):
+                        cv2.line(display_frame, (int(points[i-1][0]), int(points[i-1][1])),
+                                 (int(points[i][0]), int(points[i][1])), id1_color, 3)
         
-        # Draw frame count - increased font size from 0.7 to 0.9
-        cv2.putText(frame, f"Frame: {frame_count}", (10, 30), 
+        # Draw frame count
+        cv2.putText(display_frame, f"Frame: {frame_count}", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        
+        # Display status about primary object tracking
+        primary_status = "Primary Object: "
+        if tracker.primary_object_active:
+            primary_status += "TRACKING"
+            cv2.putText(display_frame, primary_status, (10, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        else:
+            primary_status += "LOST"
+            cv2.putText(display_frame, primary_status, (10, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
         
         # Initialize video writer on first frame if saving
         if save_video and video_writer is None:
@@ -1107,10 +1271,10 @@ def main():
         
         # Write frame if saving
         if save_video and video_writer is not None:
-            video_writer.write(frame)
+            video_writer.write(display_frame)
         
         # Resize frame for display only (processing still uses original resolution)
-        display_frame = resize_for_display(frame, max_width=1280, max_height=720)
+        display_frame = resize_for_display(display_frame, max_width=1280, max_height=720)
 
         # Display the resized frame
         cv2.imshow("Hybrid Tracking", display_frame)
@@ -1142,8 +1306,8 @@ def main():
     print(f"\nDetailed profiling stats saved to: {stats_file}")
     print("You can analyze this file with tools like snakeviz or using Python's pstats module")
     
-    # Display basic profiling stats
-    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    # Create pstats.Stats object from the file, not directly from the profiler
+    stats = pstats.Stats(stats_file).sort_stats('cumtime')
     print("\n===== TOP 20 TIME-CONSUMING FUNCTIONS =====")
     stats.print_stats(20)
     
