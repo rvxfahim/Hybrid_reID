@@ -28,6 +28,85 @@ import datetime
 from functools import wraps
 import sys
 
+# Add Numba for acceleration
+try:
+    import numba
+    from numba import jit, njit, prange
+    NUMBA_AVAILABLE = True
+    print("Numba available - using JIT compilation for performance optimization")
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Numba not available - performance optimizations disabled. Consider installing with: pip install numba")
+
+# Define Numba-accelerated IoU calculation function
+if NUMBA_AVAILABLE:
+    @njit(fastmath=True)
+    def calculate_iou_numba(box1, box2):
+        """
+        Numba-accelerated IoU calculation between two bounding boxes
+        Args:
+            box1, box2: Bounding boxes in format [x1, y1, x2, y2]
+        Returns:
+            IoU value
+        """
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate intersection area
+        x_left = max(x1_1, x1_2)
+        y_top = max(y1_1, y1_2)
+        x_right = min(x2_1, x2_2)
+        y_bottom = min(y2_1, y2_2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0  # No intersection
+            
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+        
+        # Calculate areas of both boxes
+        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+        
+        # Calculate IoU
+        iou = intersection_area / float(box1_area + box2_area - intersection_area)
+        return iou
+
+# Add Numba-optimized distance calculation function
+if NUMBA_AVAILABLE:
+    @njit(fastmath=True)
+    def calculate_spatial_distance_numba(point1, point2):
+        """
+        Numba-accelerated calculation of Euclidean distance between two points
+        Args:
+            point1: First point as (x, y)
+            point2: Second point as (x, y)
+        Returns:
+            Euclidean distance
+        """
+        return np.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
+
+# Add Numba-optimized function to find minimum value in matrix
+if NUMBA_AVAILABLE:
+    @njit(fastmath=True)
+    def find_min_value_index_numba(matrix):
+        """
+        Numba-accelerated function to find minimum value and its indices in matrix
+        Args:
+            matrix: 2D numpy array
+        Returns:
+            (min_value, i, j): tuple of minimum value and its indices
+        """
+        min_value = float('inf')
+        min_i, min_j = -1, -1
+        
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                if matrix[i, j] < min_value:
+                    min_value = matrix[i, j]
+                    min_i, min_j = i, j
+        
+        return min_value, min_i, min_j
+
 # Deep SORT and feature extraction imports
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from deep_sort_realtime.deep_sort import nn_matching
@@ -275,6 +354,71 @@ def compute_cosine_distance_gpu(features1, features2, threshold=1.0):
         
     # Return as numpy array
     return distance.cpu().numpy()
+
+# Add Numba-optimized version for when GPU is not available or for smaller matrices
+if NUMBA_AVAILABLE:
+    @njit(fastmath=True, parallel=True)
+    def compute_cosine_distance_cpu_numba(features1, features2, threshold=1.0):
+        """
+        Numba-accelerated version for computing cosine distance on CPU
+        Args:
+            features1: First set of feature vectors (numpy array)
+            features2: Second set of feature vectors (numpy array)
+            threshold: Maximum distance threshold
+        Returns:
+            Distance matrix (numpy array)
+        """
+        n1 = features1.shape[0]
+        n2 = features2.shape[0]
+        result = np.zeros((n1, n2), dtype=np.float32)
+        
+        # Ensure features are normalized
+        features1_norm = np.zeros_like(features1)
+        features2_norm = np.zeros_like(features2)
+        
+        # Normalize features1
+        for i in prange(n1):
+            norm1 = 0.0
+            for k in range(features1.shape[1]):
+                norm1 += features1[i, k] * features1[i, k]
+            norm1 = np.sqrt(norm1)
+            if norm1 > 1e-6:  # Avoid division by zero
+                for k in range(features1.shape[1]):
+                    features1_norm[i, k] = features1[i, k] / norm1
+            else:
+                for k in range(features1.shape[1]):
+                    features1_norm[i, k] = 0.0
+        
+        # Normalize features2
+        for j in prange(n2):
+            norm2 = 0.0
+            for k in range(features2.shape[1]):
+                norm2 += features2[j, k] * features2[j, k]
+            norm2 = np.sqrt(norm2)
+            if norm2 > 1e-6:  # Avoid division by zero
+                for k in range(features2.shape[1]):
+                    features2_norm[j, k] = features2[j, k] / norm2
+            else:
+                for k in range(features2.shape[1]):
+                    features2_norm[j, k] = 0.0
+        
+        # Calculate cosine similarity and convert to distance
+        for i in prange(n1):
+            for j in range(n2):
+                dot_product = 0.0
+                for k in range(features1.shape[1]):
+                    dot_product += features1_norm[i, k] * features2_norm[j, k]
+                
+                # Convert similarity to distance
+                distance = 1.0 - dot_product
+                
+                # Apply threshold
+                if threshold < 1.0 and distance > threshold:
+                    distance = threshold
+                
+                result[i, j] = distance
+                
+        return result
     
 class HybridTracker:
     def __init__(self, max_cosine_distance=0.4, nn_budget=None, max_age=30, min_confidence=0.3,
@@ -507,25 +651,66 @@ class HybridTracker:
         # Get current bbox center
         current_center_x = (bbox[0] + bbox[2]) / 2
         current_center_y = (bbox[1] + bbox[3]) / 2
+        current_center = np.array([current_center_x, current_center_y])
         
         best_match_id = None
         best_match_score = 0.6  # Threshold for feature distance
         max_spatial_distance = 200  # Maximum allowed spatial distance in pixels
         
-        # Rest of your existing feature matching code...
+        # Get all inactive IDs with valid feature galleries
+        valid_inactive_ids = []
+        all_inactive_features = []
+        id_to_feature_indices = {}
         
-        # Add spatial constraint check before returning the match
-        if best_match_id is not None:
-            # Get last known position of the matched ID
-            if best_match_id in self.track_history and len(self.track_history[best_match_id]) > 0:
-                last_pos = self.track_history[best_match_id][-1]
-                spatial_dist = np.sqrt((last_pos[0] - current_center_x)**2 + 
-                                      (last_pos[1] - current_center_y)**2)
+        # Collect feature galleries for inactive IDs
+        for inactive_id in self.inactive_ids:
+            if inactive_id in self.feature_gallery and self.feature_gallery[inactive_id]:
+                valid_features = []
+                for feature in self.feature_gallery[inactive_id]:
+                    if isinstance(feature, np.ndarray) and not np.all(feature == 0):
+                        valid_features.append(feature)
                 
-                # Reject match if too far away
-                if spatial_dist > max_spatial_distance:
-                    print(f"Rejecting match with ID {best_match_id} due to large spatial distance: {spatial_dist:.1f}px")
-                    return None
+                if valid_features:
+                    start_idx = len(all_inactive_features)
+                    all_inactive_features.extend(valid_features)
+                    id_to_feature_indices[inactive_id] = (start_idx, len(all_inactive_features))
+                    valid_inactive_ids.append(inactive_id)
+        
+        if not valid_inactive_ids:
+            return None
+        
+        # Convert to numpy arrays for batch processing
+        all_inactive_features_np = np.array(all_inactive_features)
+        current_feature_np = current_features.reshape(1, -1)
+        
+        # Calculate distances between current feature and all inactive features
+        distances = compute_cosine_distance_gpu(current_feature_np, all_inactive_features_np)
+        
+        # Find the best match by minimum distance per ID
+        for inactive_id in valid_inactive_ids:
+            start_idx, end_idx = id_to_feature_indices[inactive_id]
+            id_distances = distances[0, start_idx:end_idx]
+            min_distance = np.min(id_distances)
+            
+            if min_distance < best_match_score:
+                # Check spatial constraint
+                if inactive_id in self.track_history and len(self.track_history[inactive_id]) > 0:
+                    last_pos = self.track_history[inactive_id][-1]
+                    last_pos_array = np.array([last_pos[0], last_pos[1]])
+                    
+                    # Use Numba-accelerated function if available
+                    if NUMBA_AVAILABLE:
+                        spatial_dist = calculate_spatial_distance_numba(current_center, last_pos_array)
+                    else:
+                        spatial_dist = np.sqrt(np.sum((current_center - last_pos_array)**2))
+                    
+                    # Reject match if too far away
+                    if spatial_dist > max_spatial_distance:
+                        print(f"Rejecting match with ID {inactive_id} due to large spatial distance: {spatial_dist:.1f}px")
+                        continue
+                
+                best_match_score = min_distance
+                best_match_id = inactive_id
         
         return best_match_id
 
@@ -537,27 +722,30 @@ class HybridTracker:
         Returns:
             IoU value
         """
-        x1_1, y1_1, x2_1, y2_1 = box1
-        x1_2, y1_2, x2_2, y2_2 = box2
+        if NUMBA_AVAILABLE:
+            return calculate_iou_numba(box1, box2)
+        else:
+            x1_1, y1_1, x2_1, y2_1 = box1
+            x1_2, y1_2, x2_2, y2_2 = box2
 
-        # Calculate intersection area
-        x_left = max(x1_1, x1_2)
-        y_top = max(y1_1, y1_2)
-        x_right = min(x2_1, x2_2)
-        y_bottom = min(y2_1, y2_2)
+            # Calculate intersection area
+            x_left = max(x1_1, x1_2)
+            y_top = max(y1_1, y1_2)
+            x_right = min(x2_1, x2_2)
+            y_bottom = min(y2_1, y2_2)
 
-        if x_right < x_left or y_bottom < y_top:
-            return 0.0  # No intersection
+            if x_right < x_left or y_bottom < y_top:
+                return 0.0  # No intersection
 
-        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+            intersection_area = (x_right - x_left) * (y_bottom - y_top)
 
-        # Calculate areas of both boxes
-        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
-        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+            # Calculate areas of both boxes
+            box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+            box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
 
-        # Calculate IoU
-        iou = intersection_area / float(box1_area + box2_area - intersection_area)
-        return iou
+            # Calculate IoU
+            iou = intersection_area / float(box1_area + box2_area - intersection_area)
+            return iou
     
     # --- Make sure _perform_offline_reid uses features correctly ---
     @profile_function
@@ -877,13 +1065,19 @@ class HybridTracker:
         # Check spatial constraint if we have motion prediction
         if self.primary_object_id in self.kalman_predictions and self.primary_object_bbox is not None:
             pred_x, pred_y = self.kalman_predictions[self.primary_object_id]
-
+            
             # Get current bbox center
             current_x = (current_bbox[0] + current_bbox[2]) / 2
             current_y = (current_bbox[1] + current_bbox[3]) / 2
-
-            # Calculate spatial distance
-            spatial_dist = np.sqrt((pred_x - current_x)**2 + (pred_y - current_y)**2)
+            
+            # Calculate spatial distance - use Numba if available
+            if NUMBA_AVAILABLE:
+                spatial_dist = calculate_spatial_distance_numba(
+                    np.array([current_x, current_y]), 
+                    np.array([pred_x, pred_y])
+                )
+            else:
+                spatial_dist = np.sqrt((pred_x - current_x)**2 + (pred_y - current_y)**2)
 
             # If too far away, increase matching threshold
             if spatial_dist > 200:  # pixels
@@ -1207,7 +1401,7 @@ def main():
     id1_color = (0, 255, 0)  # Green color for primary object
     
     # Initialize video writer if needed
-    save_video = False
+    save_video = True
     video_writer = None
     
     frame_count = 0
