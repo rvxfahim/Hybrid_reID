@@ -105,43 +105,81 @@ class HybridTracker:
     def update(self, frame, detections):
         """Optimized update method focusing on primary object (ID1)"""
         self.frame_count += 1
-
-        # Format detections for DeepSORT
-        deepsort_detections = []
-
+        
+        # Prepare for batch processing
+        detection_bboxes = []
+        valid_detections = []
+        
+        # Filter detections and collect bounding boxes
         for det in detections:
             if len(det) >= 6:
                 bbox, confidence, class_id = det[:4], det[4], det[5]
                 if confidence < self.min_confidence:
                     continue
-
-                # Convert to [x1, y1, w, h] format for DeepSORT
-                x1, y1, x2, y2 = bbox
-                w, h = x2 - x1, y2 - y1
-
-                # Extract features
-                feature = self.feature_extractor.extract_features_batch(frame, [bbox])[0]
-
-                # Create detection tuple in the format expected by deep_sort_realtime
-                deepsort_detection = ([x1, y1, w, h], confidence, feature)
-                deepsort_detections.append(deepsort_detection)
+                
+                detection_bboxes.append(bbox)
+                valid_detections.append((bbox, confidence, class_id))
+        
+        # Early exit if no valid detections
+        if not detection_bboxes:
+            # Mark primary object as inactive if we don't see it
+            if self.primary_object_active:
+                self.primary_object_active = False
+            return []
+        
+        # Extract features in a single batch operation
+        detection_features = self.feature_extractor.extract_features_batch(frame, detection_bboxes)
+        
+        # Prepare DeepSORT detections
+        deepsort_detections = []
+        for i, (det_data, feature) in enumerate(zip(valid_detections, detection_features)):
+            bbox, confidence, class_id = det_data
+            x1, y1, x2, y2 = bbox
+            w, h = x2 - x1, y2 - y1
+            
+            # Create detection tuple in the format expected by deep_sort_realtime
+            deepsort_detection = ([x1, y1, w, h], confidence, feature)
+            deepsort_detections.append(deepsort_detection)
 
         # Update DeepSORT tracker with correctly formatted detections
         deepsort_tracks_returned = self.tracker.update_tracks(deepsort_detections, frame=frame)
 
-        # Process DeepSORT tracks
+        # Pre-filter confirmed tracks for more efficient processing
+        confirmed_tracks = [track for track in deepsort_tracks_returned 
+                           if track.is_confirmed() and track.time_since_update <= 1]
+        
+        # If no confirmed tracks, return empty result
+        if not confirmed_tracks:
+            if self.primary_object_active:
+                self.primary_object_active = False
+            return []
+            
+        # Initialize flag to update primary object features
+        primary_object_features_updated = False
+
+        # Process tracks
         current_tracks = []
         primary_object_seen = False
+        track_features = {}  # Store features for batch update
 
-        for track_object in deepsort_tracks_returned:
-            if not track_object.is_confirmed() or track_object.time_since_update > 1:
-                continue
-
+        for track_object in confirmed_tracks:
             track_id = track_object.track_id  # DeepSORT temporary ID
             bbox_ltrb = track_object.to_ltrb()
 
             # Get feature from track (either from DeepSORT or extract it)
-            current_feature = self._get_feature_from_track(frame, track_object, bbox_ltrb)
+            if track_object.features and isinstance(track_object.features[-1], np.ndarray):
+                current_feature = track_object.features[-1]
+            else:
+                # Skip feature extraction for non-primary tracks if possible
+                if (track_id in self.id_mapping and 
+                    self.id_mapping[track_id] != self.primary_object_id and
+                    self.primary_object_active):
+                    # For non-primary objects when primary is active, use simpler bbox extraction
+                    current_feature = np.zeros(self.feature_dim, dtype=np.float32)
+                else:
+                    # Extract feature only when necessary
+                    current_feature = self._get_feature_from_track(frame, track_object, bbox_ltrb)
+                    
             if current_feature is None:
                 continue
 
@@ -152,27 +190,40 @@ class HybridTracker:
                     self.primary_object_id = 1
                     self.id_mapping[track_id] = self.primary_object_id
                     self.primary_object_active = True
-                    print(f"Initialized primary object with ID {self.primary_object_id}")
+                    primary_object_seen = True
+                    
+                    # Set flag to initialize primary features
+                    if not hasattr(self, '_primary_features_need_update'):
+                        self._primary_features_need_update = True
                 else:
                     # For subsequent new objects, check if this could be the primary object returning
                     if not self.primary_object_active and self.primary_object_features:
                         # Only try to re-identify against the primary object
-                        if self._is_primary_object(current_feature, bbox_ltrb):  # Add bbox parameter here
+                        if self._is_primary_object(current_feature, bbox_ltrb):
                             self.id_mapping[track_id] = self.primary_object_id
                             self.primary_object_active = True
-                            print(f"Re-identified primary object with ID {self.primary_object_id}")
+                            primary_object_seen = True
+                            
+                            # Mark for update since we found primary object
+                            self._primary_features_need_update = True
                         else:
                             # Assign a new ID for other objects
                             self.id_mapping[track_id] = self.next_id
                             self.next_id += 1
                     else:
-                        # Assign a new ID for other objects
-                        self.id_mapping[track_id] = self.next_id
-                        self.next_id += 1
+                        # Try to re-identify against recently inactive objects
+                        re_id_result = self._re_identify_object(frame, bbox_ltrb, current_feature)
+                        if re_id_result is not None:
+                            self.id_mapping[track_id] = re_id_result
+                            self.inactive_ids.discard(re_id_result)
+                        else:
+                            # Assign a new ID for other objects
+                            self.id_mapping[track_id] = self.next_id
+                            self.next_id += 1
 
             consistent_id = self.id_mapping[track_id]
 
-            # Update track history and tracking info
+            # Update track history - calculate center once
             center_x = (bbox_ltrb[0] + bbox_ltrb[2]) / 2
             center_y = (bbox_ltrb[1] + bbox_ltrb[3]) / 2
             self.track_history[consistent_id].append((center_x, center_y))
@@ -181,12 +232,15 @@ class HybridTracker:
             if consistent_id == self.primary_object_id:
                 # If we have a previous bbox for the primary object, check IoU to ensure consistency
                 if self.primary_object_active and self.primary_object_bbox is not None:
-                    iou = self._calculate_iou(bbox_ltrb, self.primary_object_bbox)
+                    # Use the optimized IoU calculation
+                    if NUMBA_AVAILABLE:
+                        iou = calculate_iou_numba(bbox_ltrb, self.primary_object_bbox)
+                    else:
+                        iou = calculate_iou(bbox_ltrb, self.primary_object_bbox)
+                        
                     # If IoU is too low, either this is not the primary object or it moved very fast
-                    # Only accept if the IoU is good enough OR we haven't seen the primary object for a while
                     frames_since_last_seen = self.frame_count - self.primary_object_last_seen
-                    if iou < self.iou_threshold and frames_since_last_seen <= 5:  # Only check for recent frames
-                        print(f"Warning: Rejecting assignment to primary object due to low IoU: {iou:.3f}")
+                    if iou < self.iou_threshold and frames_since_last_seen <= 5:
                         # Create a new ID instead
                         new_id = self.next_id
                         self.next_id += 1
@@ -200,6 +254,8 @@ class HybridTracker:
                         self.primary_object_last_seen = self.frame_count
                         self.primary_object_active = True
                         primary_object_seen = True
+                        self._primary_features_need_update = True  # Mark for update
+                        primary_object_features_updated = True
 
                         # Store this bbox for the primary object
                         self.primary_object_bbox = bbox_ltrb
@@ -211,6 +267,8 @@ class HybridTracker:
                     self.primary_object_last_seen = self.frame_count
                     self.primary_object_active = True
                     primary_object_seen = True
+                    self._primary_features_need_update = True  # Mark for update
+                    primary_object_features_updated = True
 
                     # Store this bbox for the primary object
                     self.primary_object_bbox = bbox_ltrb
@@ -219,19 +277,33 @@ class HybridTracker:
             track_class_id = track_object.get_det_class() if hasattr(track_object, 'get_det_class') else \
                             (track_object.det_class if hasattr(track_object, 'det_class') else 0)
 
-            current_tracks.append([*bbox_ltrb, consistent_id, track_class_id])
+            # Store current track and feature for batch gallery update
+            track_data = [*bbox_ltrb, consistent_id, track_class_id]
+            current_tracks.append(track_data)
+            track_features[consistent_id] = current_feature
 
-        # Update primary object status if not seen in this frame
+        # Update primary object status
         if not primary_object_seen:
             self.primary_object_active = False
-
-        # Only update motion predictions for the primary object
-        if self.primary_object_id in self.track_history:
+        
+        # Only update motion predictions for the primary object if it's in the history
+        if self.primary_object_id in self.track_history and len(self.track_history[self.primary_object_id]) >= 2:
             self._update_primary_motion_prediction()
 
-        # Update feature galleries
-        self.update_feature_galleries_batch(frame, current_tracks)
-
+        # Update feature galleries in batch - more efficient than individual updates
+        if current_tracks:
+            # Convert track data for batch update
+            tracks_for_gallery = []
+            for track in current_tracks:
+                consistent_id = int(track[4])  # ID is at index 4
+                if consistent_id in track_features:
+                    # Add feature to gallery
+                    if consistent_id not in self.feature_gallery:
+                        self.feature_gallery[consistent_id] = deque(maxlen=self.gallery_size)
+                    
+                    self.feature_gallery[consistent_id].append(track_features[consistent_id])
+                    self.last_seen_frame[consistent_id] = self.frame_count
+            
         # Perform offline re-identification at regular intervals
         if self.frame_count % self.re_id_interval == 0:
             self._perform_offline_reid(frame)
@@ -350,7 +422,7 @@ class HybridTracker:
         for id1 in active_ids:
             features1 = self.feature_gallery.get(id1)
             if not features1: continue
-            recent_features1 = [f for f in list(features1)[-5:] if isinstance(f, np.ndarray)] # Take last 5 valid features
+            recent_features1 = [f for f in list(features1)[-10:] if isinstance(f, np.ndarray)] # Take last 5 valid features
             if not recent_features1: continue
 
             start_idx = len(all_active_features)
@@ -592,28 +664,36 @@ class HybridTracker:
 
         # Add IoU check if both bboxes are available
         if current_bbox is not None and self.primary_object_bbox is not None:
-            iou = self._calculate_iou(current_bbox, self.primary_object_bbox)
+            # Use the optimized IoU calculation
+            if NUMBA_AVAILABLE:
+                iou = calculate_iou_numba(current_bbox, self.primary_object_bbox)
+            else:
+                iou = calculate_iou(current_bbox, self.primary_object_bbox)
 
             # If IoU is extremely low and not much time has passed, reject as primary object
             frames_since_last_seen = self.frame_count - self.primary_object_last_seen
             if iou < 0.1 and frames_since_last_seen < 30:  # Adjust thresholds as needed
-                print(f"Rejecting primary object candidate due to very low IoU: {iou:.3f}")
                 return False
 
-        # Convert features to tensors
-        features1 = [current_feature]
-        features2 = list(self.primary_object_features)
-
-        # Use GPU for faster computation
-        features1_tensor = torch.tensor(features1, dtype=torch.float32).cuda()
-        features2_tensor = torch.tensor(features2, dtype=torch.float32).cuda()
-
+        # Cache for primary object features tensor
+        if not hasattr(self, '_primary_features_tensor_cache') or self._primary_features_need_update:
+            # Convert features to tensor only when primary features change
+            features2 = list(self.primary_object_features)
+            self._primary_features_tensor = torch.tensor(features2, dtype=torch.float32).cuda()
+            self._primary_features_norm = F.normalize(self._primary_features_tensor, p=2, dim=1)
+            self._primary_features_need_update = False
+        
+        # Convert current feature to tensor (can't avoid this one-time conversion)
+        if isinstance(current_feature, np.ndarray):
+            features1_tensor = torch.tensor([current_feature], dtype=torch.float32).cuda()
+        else:
+            features1_tensor = torch.tensor(current_feature, dtype=torch.float32).unsqueeze(0).cuda()
+        
         # Normalize features
         features1_norm = F.normalize(features1_tensor, p=2, dim=1)
-        features2_norm = F.normalize(features2_tensor, p=2, dim=1)
 
-        # Calculate similarity
-        similarity = torch.mm(features1_norm, features2_norm.t())
+        # Calculate similarity with cached primary features
+        similarity = torch.mm(features1_norm, self._primary_features_norm.t())
 
         # Get max similarity
         max_sim = torch.max(similarity).item()
@@ -623,7 +703,7 @@ class HybridTracker:
         reid_threshold = 0.2  # Lower threshold = more strict matching
 
         # Check spatial constraint if we have motion prediction
-        if self.primary_object_id in self.kalman_predictions and self.primary_object_bbox is not None:
+        if self.primary_object_id in self.kalman_predictions and current_bbox is not None:
             pred_x, pred_y = self.kalman_predictions[self.primary_object_id]
             
             # Get current bbox center
@@ -654,25 +734,49 @@ class HybridTracker:
         positions = self.track_history[self.primary_object_id]
         if len(positions) < 2:
             return
+        
+        # Check if we need to update the prediction
+        if hasattr(self, '_last_prediction_frame') and self._last_prediction_frame == self.frame_count:
+            # Already updated for this frame
+            return
             
-        # Take last 5 positions
-        recent_positions = list(positions)[-5:]
+        # Cache the update frame
+        self._last_prediction_frame = self.frame_count
+            
+        # Take last 5 positions or fewer if not available
+        # FIX: Use slice notation to get multiple positions
+        recent_positions = list(positions)[-min(5, len(positions)):]
         
-        # Convert to tensor
-        track_tensor = torch.tensor(recent_positions, dtype=torch.float32).cuda()
+        # Safety check - need at least 2 positions for velocity calculation
+        if len(recent_positions) < 2:
+            return
+            
+        # Convert to tensor once with proper type
+        if not hasattr(self, '_positions_tensor') or len(self._positions_tensor) != len(recent_positions):
+            track_tensor = torch.tensor(recent_positions, dtype=torch.float32).cuda()
+            self._positions_tensor = track_tensor
+        else:
+            # Reuse tensor but update values - more efficient than creating a new tensor
+            if len(self._positions_tensor) == len(recent_positions):
+                for i, pos in enumerate(recent_positions):
+                    self._positions_tensor[i, 0] = pos[0]
+                    self._positions_tensor[i, 1] = pos[1]
+            else:
+                # If dimensions don't match, create a new tensor
+                self._positions_tensor = torch.tensor(recent_positions, dtype=torch.float32).cuda()
         
-        # Calculate velocity
-        velocity = track_tensor[1:] - track_tensor[:-1]
+        # Calculate velocity using tensor operations
+        velocity = self._positions_tensor[1:] - self._positions_tensor[:-1]
         avg_velocity = torch.mean(velocity, dim=0)
         
         # Predict next position
-        last_pos = track_tensor[-1]
+        last_pos = self._positions_tensor[-1]
         pred_pos = last_pos + avg_velocity
         
-        # Store prediction
+        # Store prediction - ensure we extract scalar values properly
         self.kalman_predictions[self.primary_object_id] = (
-            pred_pos[0].item(),
-            pred_pos[1].item()
+            float(pred_pos[0].item()), 
+            float(pred_pos[1].item())
         )
 
     @profile_function
@@ -683,21 +787,43 @@ class HybridTracker:
             return track_object.features[-1]
         
         # If not available, extract manually
-        if bbox_ltrb[2] > bbox_ltrb[0] and bbox_ltrb[3] > bbox_ltrb[1]:
-            # Extract single feature
-            x1, y1, x2, y2 = map(int, bbox_ltrb)
+        if bbox_ltrb[2] <= bbox_ltrb[0] or bbox_ltrb[3] <= bbox_ltrb[1]:
+            return None  # Early return for invalid bbox
+            
+        # Extract single feature
+        x1, y1, x2, y2 = map(int, bbox_ltrb)
+            
+        # Add boundary checks to prevent out-of-bounds errors
+        height, width = frame.shape[:2]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(width, x2)
+        y2 = min(height, y2)
+            
+        # Early return if crop would be too small
+        if x2 - x1 < 3 or y2 - y1 < 3:
+            return None
+            
+        # Use array slicing directly instead of creating temporary variables when possible
+        with torch.no_grad():  # Ensure no gradients computed
+            # Convert crop directly to tensor without intermediate PIL conversion
+            # This avoids extra memory allocations
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 return None
                 
+            # Only convert color if needed
             crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(crop)
-            img_tensor = self.feature_extractor.transform(img).unsqueeze(0).to(self.feature_extractor.device)
             
-            with torch.no_grad():
-                feature = self.feature_extractor.model(img_tensor)
-                feature = F.normalize(feature, p=2, dim=1).cpu().numpy()[0]
-                
+            # Use the feature extractor's transform and model directly
+            img_tensor = self.feature_extractor.transform(img).unsqueeze(0)
+            
+            # Move to GPU only once
+            img_tensor = img_tensor.to(self.feature_extractor.device, non_blocking=True)
+            
+            # Get feature and normalize in one step if possible
+            feature = self.feature_extractor.model(img_tensor)
+            feature = F.normalize(feature, p=2, dim=1).cpu().numpy()[0]
+            
             return feature
-        
-        return None

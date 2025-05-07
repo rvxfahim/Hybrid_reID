@@ -32,26 +32,7 @@ def main():
     setup_signal_handler()
     
     # Initialize video capture - handle WSL path issues
-    video_path = "./left_view.mp4"  # Default path
-    
-    # First check if video exists in the current directory
-    if not os.path.exists(video_path):
-        # Check for alternative paths based on workspace structure
-        alternative_paths = [
-            # Full absolute path (useful in WSL)
-            os.path.abspath("left_view.mp4"),
-            # Try without ./ prefix
-            "left_view.mp4",
-            # Try folder from workspace context
-            "./OneDrive_1_5-3-2025/HD1080_SN37677146_12-38-27/left_view.mp4",
-        ]
-        
-        # Try alternative paths
-        for alt_path in alternative_paths:
-            if os.path.exists(alt_path):
-                video_path = alt_path
-                print(f"Found video at: {video_path}")
-                break
+    video_path = "./MOT_edited.mp4"  # Default path
     
     # If still not found, use webcam
     if not os.path.exists(video_path):
@@ -97,9 +78,9 @@ def main():
         nn_budget=2000,                # Keep or increase if memory allows
         max_age=final_max_age,         # Use dynamically calculated max_age
         min_confidence=0.3,
-        re_id_interval=10,              # Set to run re-ID frequently since DINOv2 is powerful
-        gallery_size=3000,             # Keep or increase if needed
-        iou_threshold=0.1              # Adjust based on testing
+        re_id_interval=1,              # Set to run re-ID frequently since DINOv2 is powerful
+        gallery_size=50,             # Keep or increase if needed
+        iou_threshold=0.25              # Adjust based on testing
     )
     
     # Define color for ID1 (primary object)
