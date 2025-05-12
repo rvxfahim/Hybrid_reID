@@ -63,13 +63,14 @@ class FeatureExtractor:
         print(f"Feature extractor initialized with feature dimension: {self.feature_dim}")
         
     @profile_function
-    def extract_features_batch(self, frame, bboxes):
+    def extract_features_batch(self, frame, bboxes, masks=None):
         """
-        Extract features for multiple bounding boxes in a single GPU operation
+        Extract features for multiple bounding boxes in a single GPU operation, applying masks if provided.
         
         Args:
             frame: Current video frame (BGR format)
             bboxes: List of bounding boxes as [x1, y1, x2, y2]
+            masks: Optional list of mask tensors corresponding to bboxes. Mask is applied if not None.
             
         Returns:
             Batch of feature vectors (numpy array)
@@ -77,9 +78,15 @@ class FeatureExtractor:
         if not bboxes:
             return []
             
-        crops = []
+        crops_transformed = []
         valid_indices = []
         
+        # Ensure masks list has the same length as bboxes if provided, padding with None if necessary
+        if masks is None:
+            masks = [None] * len(bboxes)
+        elif len(masks) < len(bboxes):
+            masks.extend([None] * (len(bboxes) - len(masks)))
+
         # Prepare crops for all valid bounding boxes
         for i, bbox in enumerate(bboxes):
             try:
@@ -92,22 +99,45 @@ class FeatureExtractor:
                 
                 if x2 <= x1 or y2 <= y1:
                     continue
-                    
+
                 crop = frame[y1:y2, x1:x2]
-                crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(crop)
-                crops.append(self.transform(img))
+                if crop.size == 0:
+                    continue
+
+                current_mask = masks[i]
+                if current_mask is not None:
+                    try:
+                        mask_np = current_mask.cpu().numpy().astype(np.uint8) # Assuming mask is a PyTorch tensor
+                        # Resize mask to crop dimensions
+                        mask_resized = cv2.resize(mask_np, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        
+                        # Ensure mask is binary (0 or 1) then scale to 0 or 255 for bitwise_and
+                        binary_mask = (mask_resized > 0).astype(np.uint8) * 255
+
+                        if len(crop.shape) == 3: # Color image
+                            # Convert single channel mask to 3 channels
+                            mask_3channel = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
+                            crop = cv2.bitwise_and(crop, mask_3channel)
+                        elif len(crop.shape) == 2: # Grayscale image (should not happen with BGR frame)
+                             crop = cv2.bitwise_and(crop, binary_mask)
+                    except Exception as e:
+                        print(f"Error applying mask: {e}. Proceeding without mask for this crop.")
+                
+                # Convert crop to RGB and then to PIL Image
+                img_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                crops_transformed.append(self.transform(img_pil))
                 valid_indices.append(i)
                 
             except Exception as e:
+                # print(f"Error processing bbox {bbox}: {e}") # Optional: for debugging
                 continue
                 
         # Process all crops in a single batch
-        if not crops:
+        if not crops_transformed:
             return [np.zeros(self.feature_dim, dtype=np.float32)] * len(bboxes)
             
         # Stack crops into a batch tensor
-        batch = torch.stack(crops).to(self.device)
+        batch = torch.stack(crops_transformed).to(self.device)
         
         # Measure specifically the model inference time
         inference_start = time.time()
@@ -119,16 +149,20 @@ class FeatureExtractor:
             
         # Calculate inference time
         inference_time = time.time() - inference_start
-        print(f"DINO feature extraction: {inference_time*1000:.1f}ms for {len(crops)} objects")
+        # print(f"DINO feature extraction: {inference_time*1000:.1f}ms for {len(crops_transformed)} objects") # Optional
             
         # If only one crop, ensure we have correct dimensions
-        if len(crops) == 1:
-            features_batch = features_batch.reshape(1, -1)
-            
+        if len(crops_transformed) == 1 and len(features_batch.shape) == 2 : # check if features_batch is not already (1, dim)
+             pass # features_batch is already (1, dim)
+        elif len(crops_transformed) == 1 and len(features_batch.shape) == 1: # if it was (dim,)
+             features_batch = features_batch.reshape(1, -1)
+
+
         # Create result array with zeros for invalid bboxes
-        result = [np.zeros(self.feature_dim, dtype=np.float32)] * len(bboxes)
+        result = [np.zeros(self.feature_dim, dtype=np.float32) for _ in range(len(bboxes))]
         for i, valid_idx in enumerate(valid_indices):
-            result[valid_idx] = features_batch[i].astype(np.float32)
+            if i < len(features_batch):
+                 result[valid_idx] = features_batch[i].astype(np.float32)
             
         return result
 

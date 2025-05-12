@@ -173,3 +173,24 @@ def create_mock_detector(cap):
     # Create a mock detector object with the detect method
     mock_detector = type('', (), {'detect': mock_detect})()
     return mock_detector
+
+def convert_bbox_format(bbox, conversion_type):
+    """
+    Convert bounding box formats:
+      - 'tlwh_to_ltrb': [x, y, w, h] -> [x1, y1, x2, y2]
+      - 'ltrb_to_tlwh': [x1, y1, x2, y2] -> [x, y, w, h]
+    """
+    if conversion_type == "tlwh_to_ltrb":
+        x, y, w, h = bbox
+        x1 = int(x)
+        y1 = int(y)
+        x2 = int(x + w)
+        y2 = int(y + h)
+        return [x1, y1, x2, y2]
+    elif conversion_type == "ltrb_to_tlwh":
+        x1, y1, x2, y2 = bbox
+        w = int(x2 - x1)
+        h = int(y2 - y1)
+        return [int(x1), int(y1), w, h]
+    else:
+        raise ValueError(f"Unsupported conversion type: {conversion_type}")

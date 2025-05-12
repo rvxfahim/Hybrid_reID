@@ -9,7 +9,7 @@ import time
 from profiling import profile_function
 
 class YOLODetector:
-    def __init__(self, model_path=None, conf_threshold=0.25, device='cuda'):
+    def __init__(self, model_path=None, conf_threshold=0.25, device='cpu'):
         """
         Initialize YOLO detector specialized for human detection
         
@@ -19,19 +19,28 @@ class YOLODetector:
             device: Computing device ('cuda' or 'cpu')
         """
         self.device = device
+        self.conf_threshold = conf_threshold
+        self.person_class_id = 0  # Human class ID in COCO dataset
         
         try:
             from ultralytics import YOLO
             
-            # Change the default model to YOLOv11
+            # Change the default model to a YOLOv8 segmentation model
             if model_path is None:
-                self.model = YOLO("yolo11n.pt").to(self.device)  # Use YOLOv11 nano model with device
+                # User should ensure 'yolov8n-seg.pt' or their desired segmentation model is available
+                print("Attempting to load default segmentation model: yolov8n-seg.pt")
+                self.model = YOLO("yolo11n-seg.pt").to(self.device)
             else:
+                print(f"Loading specified model: {model_path}")
                 self.model = YOLO(model_path).to(self.device)
                 
             self.using_ultralytics = True
-            print(f"Using YOLOv11 from ultralytics (human detection only)")
-            
+            # Check if the loaded model has segmentation capabilities
+            if not hasattr(self.model, 'predict') or not callable(getattr(self.model, 'predict')) or not any(hasattr(res, 'masks') for res in self.model(np.zeros((224,224,3), dtype=np.uint8))):
+                 print(f"Warning: Model {model_path or 'yolo11n-seg.pt'} might not be a segmentation model or is not behaving as expected.")
+            else:
+                 print(f"Using YOLO segmentation model from ultralytics (human detection only)")
+
         except ImportError:
             print("Ultralytics YOLO not available, using OpenCV DNN module")
             # Fall back to OpenCV DNN (note: this fallback won't support YOLOv11)
@@ -50,10 +59,6 @@ class YOLODetector:
                 self.classes = f.read().strip().split("\n")
             
             print("Warning: Fallback mode does not support YOLOv11")
-        
-        self.conf_threshold = conf_threshold
-        # COCO dataset: class 0 is 'person'
-        self.person_class_id = 0  # Human class ID in COCO dataset
     
     @profile_function
     def detect(self, frame):
@@ -64,39 +69,41 @@ class YOLODetector:
             frame: Input frame
             
         Returns:
-            List of human detections as [x1, y1, x2, y2, confidence, class_id]
+            List of human detections as [x1, y1, x2, y2, confidence, class_id, mask_tensor_or_None]
         """
-        # Start timing specifically the model inference part
         inference_start = time.time()
         
         if self.using_ultralytics:
-            # Use YOLO from ultralytics - only detect humans (class 0)
-            # Add class filtering to the model prediction to reduce computation
-            results = self.model(frame, device=self.device, classes=[self.person_class_id])
+            results = self.model(frame, device=self.device, classes=[self.person_class_id], verbose=False) # Added verbose=False
             
-            # Calculate and print inference time
             inference_time = time.time() - inference_start
-            print(f"YOLO model inference: {inference_time*1000:.1f}ms")
+            # print(f"YOLO model inference: {inference_time*1000:.1f}ms") # Optional
             
-            # Process detections (should only be humans due to class filtering)
             detections = []
-            for result in results:
+            for result in results: # Iterates over images in batch (usually 1)
                 boxes = result.boxes
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    conf = box.conf[0].item()
-                    cls = box.cls[0].item()
-                    
-                    # Skip if conf is below threshold 
-                    # (class check is redundant here since we filtered in the model call)
-                    if conf < self.conf_threshold:
-                        continue
-                    
-                    detections.append([x1, y1, x2, y2, conf, cls])
-            
+                masks = result.masks  # Get masks object
+
+                if boxes is not None:
+                    for i in range(len(boxes)):
+                        box = boxes[i]
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        conf = box.conf[0].item()
+                        cls = box.cls[0].item()
+                        
+                        current_mask_tensor = None
+                        if masks is not None and masks.data is not None and i < len(masks.data):
+                            # masks.data contains the mask tensors [H, W]
+                            # It's important that these masks are correctly aligned with the boxes
+                            current_mask_tensor = masks.data[i] 
+                        
+                        if conf < self.conf_threshold:
+                            continue
+                        
+                        detections.append([x1, y1, x2, y2, conf, cls, current_mask_tensor])
             return detections
         else:
-            # Use OpenCV DNN
+            # OpenCV DNN fallback (does not support segmentation masks)
             height, width = frame.shape[:2]
             
             # Create blob from image
@@ -136,6 +143,6 @@ class YOLODetector:
                         x2 = x1 + w
                         y2 = y1 + h
                         
-                        detections.append([x1, y1, x2, y2, confidence, class_id])
+                        detections.append([x1, y1, x2, y2, confidence, class_id, None]) # Add None for mask
             
             return detections

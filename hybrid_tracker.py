@@ -17,6 +17,7 @@ from numba_optimizations import NUMBA_AVAILABLE, calculate_iou, calculate_iou_nu
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from deep_sort_realtime.deep_sort import nn_matching
 from deep_sort_realtime.deep_sort.detection import Detection
+from utils import convert_bbox_format  # Added import for convert_bbox_format
 
 class HybridTracker:
     def __init__(self, max_cosine_distance=0.4, nn_budget=None, max_age=30, min_confidence=0.3,
@@ -76,6 +77,9 @@ class HybridTracker:
         self.primary_object_last_seen = 0  # Last frame where primary object was seen
         self.primary_object_active = False  # Whether the primary object is currently being tracked
         self.primary_object_bbox = None  # Keep track of the primary object's bounding box
+
+        # Store current frame's detections with masks
+        self.current_frame_detections_details = []
     
     @profile_function
     def update_feature_galleries_batch(self, frame, tracks):
@@ -83,29 +87,80 @@ class HybridTracker:
         if not tracks:
             return
 
-        # Extract bboxes for feature extraction
-        bboxes = [track[:4] for track in tracks]  # [x1, y1, x2, y2]
-        track_ids = [int(track[4]) for track in tracks]  # consistent_ids
+        bboxes_to_extract = []
+        masks_to_extract = []
+        track_ids_for_features = []
 
-        # Extract features in a batch
-        features_batch = self.feature_extractor.extract_features_batch(frame, bboxes)
+        for track in tracks:
+            if not track.is_confirmed(): # Only for confirmed tracks
+                continue
 
-        # Update galleries with the new features
-        for i, (track_id, feature) in enumerate(zip(track_ids, features_batch)):
-            if np.all(feature == 0):
-                continue  # Skip invalid features
+            track_bbox_ltrb = convert_bbox_format(track.to_tlwh(), "tlwh_to_ltrb")
             
-            if track_id not in self.feature_gallery:
-                self.feature_gallery[track_id] = deque(maxlen=self.gallery_size)
+            # Find the corresponding mask from current frame's detections
+            # This assumes track.to_tlwh() gives a bbox that can be matched to an original detection
+            # A more robust way would be to link track to its original detection if possible
+            # For simplicity, we try to find a matching detection by bbox center or IOU.
+            # Or, if the track was just updated, its bbox should be very close to one of the detections.
+            
+            # Simple lookup: find a detection whose bbox (xyxy) matches track_bbox_ltrb (also xyxy)
+            # Convert track_bbox_ltrb to a common format for comparison if needed.
+            # self.current_frame_detections_details contains (bbox_xyxy, conf, cls, mask)
+            
+            best_match_mask = None
+            # track_bbox_xyxy is already ltrb, which is xyxy if x1,y1,x2,y2
+            # Let's use a small tolerance for matching
+            track_center_x = (track_bbox_ltrb[0] + track_bbox_ltrb[2]) / 2
+            track_center_y = (track_bbox_ltrb[1] + track_bbox_ltrb[3]) / 2
 
-            self.feature_gallery[track_id].append(feature)
-            self.last_seen_frame[track_id] = self.frame_count
+            min_dist_sq = float('inf')
+
+            for det_bbox_xyxy, _, _, det_mask in self.current_frame_detections_details:
+                # Check if track_bbox_ltrb is close to det_bbox_xyxy
+                # This is a simplified matching. IOU would be better.
+                det_center_x = (det_bbox_xyxy[0] + det_bbox_xyxy[2]) / 2
+                det_center_y = (det_bbox_xyxy[1] + det_bbox_xyxy[3]) / 2
+                dist_sq = (track_center_x - det_center_x)**2 + (track_center_y - det_center_y)**2
+                
+                # A simple heuristic: if centers are very close and dimensions are similar
+                # A proper IOU match would be more robust here.
+                # For now, if a detection's bbox is very similar to track's current bbox.
+                # This matching is crucial and might need refinement.
+                # Let's assume if the track is active and confirmed, its bbox is from a recent detection.
+                # We can use IOU to find the best matching detection for the track's current bbox.
+                current_iou = calculate_iou(track_bbox_ltrb, det_bbox_xyxy)
+                if current_iou > 0.7: # High IOU threshold to ensure it's the same object
+                    if det_mask is not None: # Check if this detection has a mask
+                         best_match_mask = det_mask
+                         break # Found a good match
+
+            bboxes_to_extract.append(track_bbox_ltrb)
+            masks_to_extract.append(best_match_mask) # Will be None if no good match or no mask
+            track_ids_for_features.append(track.track_id)
+
+        if not bboxes_to_extract:
+            return
+
+        # Batch extract features
+        extracted_features = self.feature_extractor.extract_features_batch(frame, bboxes_to_extract, masks_to_extract)
+
+        for i, track_id in enumerate(track_ids_for_features):
+            feature = extracted_features[i]
+            if feature is not None and np.any(feature): # Ensure feature is valid
+                if track_id not in self.feature_gallery:
+                    self.feature_gallery[track_id] = []
+                self.feature_gallery[track_id].append(feature)
+                # Keep gallery size limited
+                if len(self.feature_gallery[track_id]) > self.gallery_size:
+                    self.feature_gallery[track_id].pop(0)
         
     @profile_function
     def update(self, frame, detections):
         """Optimized update method focusing on primary object (ID1)"""
         self.frame_count += 1
-        
+        # detections_from_yolo is now [(x1,y1,x2,y2, conf, cls, mask_tensor_or_None), ...]
+        self.current_frame_detections_details = detections
+
         # Prepare for batch processing
         detection_bboxes = []
         valid_detections = []
@@ -127,8 +182,49 @@ class HybridTracker:
                 self.primary_object_active = False
             return []
         
-        # Extract features in a single batch operation
-        detection_features = self.feature_extractor.extract_features_batch(frame, detection_bboxes)
+        # If primary object is active and we have continuous tracking, we can optimize
+        optimize_feature_extraction = self.primary_object_active and self.frame_count - self.primary_object_last_seen <= 3
+        
+        # Extract features in a single batch operation - only if needed
+        if optimize_feature_extraction:
+            # Only extract features for potential primary objects based on spatial proximity
+            # to last known primary object location
+            primary_candidates = []
+            other_indices = []
+            
+            if self.primary_object_bbox is not None:
+                for i, bbox in enumerate(detection_bboxes):
+                    # Calculate IoU with primary object bbox
+                    if NUMBA_AVAILABLE:
+                        iou = calculate_iou_numba(bbox, self.primary_object_bbox)
+                    else:
+                        iou = calculate_iou(bbox, self.primary_object_bbox)
+                    
+                    # If high IoU, consider as primary candidate
+                    if iou > 0.3:  # Lower threshold for candidates
+                        primary_candidates.append(i)
+                    else:
+                        other_indices.append(i)
+            else:
+                # No previous primary bbox, extract all features
+                primary_candidates = list(range(len(detection_bboxes)))
+                other_indices = []
+            
+            # Extract features only for primary candidates
+            if primary_candidates:
+                primary_bboxes = [detection_bboxes[i] for i in primary_candidates]
+                primary_features = self.feature_extractor.extract_features_batch(frame, primary_bboxes)
+                
+                # Create empty features for other detections to maintain indexing
+                detection_features = [None] * len(detection_bboxes)
+                for i, feat_idx in enumerate(primary_candidates):
+                    detection_features[feat_idx] = primary_features[i]
+            else:
+                # No primary candidates, create empty features
+                detection_features = [None] * len(detection_bboxes)
+        else:
+            # Standard processing - extract all features
+            detection_features = self.feature_extractor.extract_features_batch(frame, detection_bboxes)
         
         # Prepare DeepSORT detections
         deepsort_detections = []
@@ -136,6 +232,10 @@ class HybridTracker:
             bbox, confidence, class_id = det_data
             x1, y1, x2, y2 = bbox
             w, h = x2 - x1, y2 - y1
+            
+            # If feature is None (skipped extraction), provide zeros
+            if feature is None:
+                feature = np.zeros(self.feature_dim, dtype=np.float32)
             
             # Create detection tuple in the format expected by deep_sort_realtime
             deepsort_detection = ([x1, y1, w, h], confidence, feature)
@@ -154,9 +254,6 @@ class HybridTracker:
                 self.primary_object_active = False
             return []
             
-        # Initialize flag to update primary object features
-        primary_object_features_updated = False
-
         # Process tracks
         current_tracks = []
         primary_object_seen = False
@@ -167,19 +264,35 @@ class HybridTracker:
             bbox_ltrb = track_object.to_ltrb()
 
             # Get feature from track (either from DeepSORT or extract it)
-            if track_object.features and isinstance(track_object.features[-1], np.ndarray):
-                current_feature = track_object.features[-1]
-            else:
-                # Skip feature extraction for non-primary tracks if possible
-                if (track_id in self.id_mapping and 
-                    self.id_mapping[track_id] != self.primary_object_id and
-                    self.primary_object_active):
-                    # For non-primary objects when primary is active, use simpler bbox extraction
-                    current_feature = np.zeros(self.feature_dim, dtype=np.float32)
+            current_feature = None
+            
+            # First check if this could be the primary object
+            is_primary_candidate = False
+            if track_id in self.id_mapping and self.id_mapping[track_id] == self.primary_object_id:
+                is_primary_candidate = True
+            elif self.primary_object_active and self.primary_object_bbox is not None:
+                # Check IoU
+                if NUMBA_AVAILABLE:
+                    iou = calculate_iou_numba(bbox_ltrb, self.primary_object_bbox)
                 else:
-                    # Extract feature only when necessary
+                    iou = calculate_iou(bbox_ltrb, self.primary_object_bbox)
+                
+                if iou > 0.3:
+                    is_primary_candidate = True
+            elif not self.primary_object_active:
+                # If primary is lost, all objects are candidates for reID
+                is_primary_candidate = True
+                
+            # Only extract features for primary candidates or when we need them
+            if is_primary_candidate or not optimize_feature_extraction:
+                if track_object.features and isinstance(track_object.features[-1], np.ndarray):
+                    current_feature = track_object.features[-1]
+                else:
                     current_feature = self._get_feature_from_track(frame, track_object, bbox_ltrb)
-                    
+            else:
+                # For non-primary objects when optimizing, use empty features
+                current_feature = np.zeros(self.feature_dim, dtype=np.float32)
+
             if current_feature is None:
                 continue
 
@@ -250,12 +363,15 @@ class HybridTracker:
                         # Update primary object information
                         if not hasattr(self, 'primary_object_features'):
                             self.primary_object_features = deque(maxlen=self.gallery_size)
-                        self.primary_object_features.append(current_feature)
+                        
+                        # Only update primary features if we have a valid feature
+                        if not np.all(current_feature == 0):
+                            self.primary_object_features.append(current_feature)
+                            
                         self.primary_object_last_seen = self.frame_count
                         self.primary_object_active = True
                         primary_object_seen = True
                         self._primary_features_need_update = True  # Mark for update
-                        primary_object_features_updated = True
 
                         # Store this bbox for the primary object
                         self.primary_object_bbox = bbox_ltrb
@@ -263,12 +379,15 @@ class HybridTracker:
                     # No previous bbox, update primary object information
                     if not hasattr(self, 'primary_object_features'):
                         self.primary_object_features = deque(maxlen=self.gallery_size)
-                    self.primary_object_features.append(current_feature)
+                    
+                    # Only update primary features if we have a valid feature
+                    if not np.all(current_feature == 0):
+                        self.primary_object_features.append(current_feature)
+                    
                     self.primary_object_last_seen = self.frame_count
                     self.primary_object_active = True
                     primary_object_seen = True
                     self._primary_features_need_update = True  # Mark for update
-                    primary_object_features_updated = True
 
                     # Store this bbox for the primary object
                     self.primary_object_bbox = bbox_ltrb
@@ -280,7 +399,10 @@ class HybridTracker:
             # Store current track and feature for batch gallery update
             track_data = [*bbox_ltrb, consistent_id, track_class_id]
             current_tracks.append(track_data)
-            track_features[consistent_id] = current_feature
+            
+            # Only store non-zero features
+            if not np.all(current_feature == 0):
+                track_features[consistent_id] = current_feature
 
         # Update primary object status
         if not primary_object_seen:
@@ -290,23 +412,35 @@ class HybridTracker:
         if self.primary_object_id in self.track_history and len(self.track_history[self.primary_object_id]) >= 2:
             self._update_primary_motion_prediction()
 
-        # Update feature galleries in batch - more efficient than individual updates
+        # Update feature galleries - more selective approach
         if current_tracks:
-            # Convert track data for batch update
-            tracks_for_gallery = []
+            # Only update galleries for primary object when tracking continuously
+            # and for all objects when primary is lost or we need to re-identify
             for track in current_tracks:
                 consistent_id = int(track[4])  # ID is at index 4
-                if consistent_id in track_features:
-                    # Add feature to gallery
-                    if consistent_id not in self.feature_gallery:
-                        self.feature_gallery[consistent_id] = deque(maxlen=self.gallery_size)
+                
+                # Only update features for primary objects or when optimization is off
+                if (consistent_id == self.primary_object_id or 
+                    not optimize_feature_extraction or 
+                    not self.primary_object_active):
                     
-                    self.feature_gallery[consistent_id].append(track_features[consistent_id])
-                    self.last_seen_frame[consistent_id] = self.frame_count
+                    if consistent_id in track_features:
+                        # Add feature to gallery
+                        if consistent_id not in self.feature_gallery:
+                            self.feature_gallery[consistent_id] = deque(maxlen=self.gallery_size)
+                        
+                        self.feature_gallery[consistent_id].append(track_features[consistent_id])
+                
+                # Always update last_seen_frame
+                self.last_seen_frame[consistent_id] = self.frame_count
             
         # Perform offline re-identification at regular intervals
-        if self.frame_count % self.re_id_interval == 0:
+        # But only if primary object is lost or it's been a while since last reID
+        if (self.frame_count % self.re_id_interval == 0 and 
+            (not self.primary_object_active or 
+             self.frame_count - getattr(self, '_last_reid_frame', 0) >= self.re_id_interval * 2)):
             self._perform_offline_reid(frame)
+            self._last_reid_frame = self.frame_count
 
         return current_tracks
 
@@ -401,14 +535,55 @@ class HybridTracker:
         """
         Perform offline re-identification using GPU-batched distance calculation.
         Merges an active track with a recently inactive one if they look similar.
+        
+        When primary object tracking is active, focuses efforts on primary ID.
+        
         Args:
             frame: Current video frame (may not be needed directly here)
         """
         active_ids = set(self.id_mapping.values()) - self.inactive_ids
         inactive_ids_list = list(self.inactive_ids)
 
+        # Early exit if nothing to compare
         if not active_ids or not inactive_ids_list:
             return
+
+        # Determine if we should operate in optimized primary-only mode
+        primary_only_mode = (self.primary_object_active and 
+                            self.primary_object_id in active_ids and 
+                            self.frame_count - self.primary_object_last_seen <= 5)
+            
+        # In primary-only mode, restrict which IDs to process
+        if primary_only_mode:
+            active_ids = {self.primary_object_id}
+            
+            # Also filter inactive IDs if we have motion prediction for the primary
+            # to focus only on the most likely candidates for primary re-identification
+            if self.primary_object_id in self.kalman_predictions and self.primary_object_bbox is not None:
+                filtered_inactive_ids = []
+                pred_x, pred_y = self.kalman_predictions[self.primary_object_id]
+                pred_pos = np.array([pred_x, pred_y])
+                
+                # Only consider inactive IDs that are spatially close to the primary prediction
+                for inactive_id in inactive_ids_list:
+                    if inactive_id in self.track_history and len(self.track_history[inactive_id]) > 0:
+                        last_pos = self.track_history[inactive_id][-1]  # (x, y)
+                        if isinstance(last_pos, tuple) and len(last_pos) == 2:
+                            last_pos_array = np.array([last_pos[0], last_pos[1]])
+                            
+                            # Calculate spatial distance
+                            if NUMBA_AVAILABLE:
+                                spatial_dist = calculate_spatial_distance_numba(pred_pos, last_pos_array)
+                            else:
+                                spatial_dist = np.sqrt(np.sum((pred_pos - last_pos_array)**2))
+                                
+                            # Only include inactive IDs that are within reasonable distance
+                            if spatial_dist < 300:  # pixels
+                                filtered_inactive_ids.append(inactive_id)
+                
+                # If we found spatially close inactive IDs, use only those
+                if filtered_inactive_ids:
+                    inactive_ids_list = filtered_inactive_ids
 
         # --- 1. Gather Features and Create Index Maps ---
         all_active_features = []
@@ -422,7 +597,14 @@ class HybridTracker:
         for id1 in active_ids:
             features1 = self.feature_gallery.get(id1)
             if not features1: continue
-            recent_features1 = [f for f in list(features1)[-10:] if isinstance(f, np.ndarray)] # Take last 5 valid features
+            
+            # For primary ID in primary-only mode, use all good features
+            if primary_only_mode and id1 == self.primary_object_id:
+                recent_features1 = [f for f in list(features1) if isinstance(f, np.ndarray) and not np.all(f == 0)]
+            else:
+                # For other IDs or normal mode, just use most recent features
+                recent_features1 = [f for f in list(features1)[-10:] if isinstance(f, np.ndarray) and not np.all(f == 0)]
+                
             if not recent_features1: continue
 
             start_idx = len(all_active_features)
@@ -436,7 +618,7 @@ class HybridTracker:
         for id2 in inactive_ids_list:
             features2 = self.feature_gallery.get(id2)
             if not features2: continue
-            gallery_features2 = [f for f in features2 if isinstance(f, np.ndarray)] # Take all valid features
+            gallery_features2 = [f for f in features2 if isinstance(f, np.ndarray) and not np.all(f == 0)]
             if not gallery_features2: continue
 
             start_idx = len(all_inactive_features)
@@ -446,8 +628,7 @@ class HybridTracker:
             valid_inactive_ids.append(id2)
 
         if not all_active_features or not all_inactive_features:
-            # print("Offline ReID: No features to compare.")
-            return # Nothing to compare
+            return  # Nothing to compare
 
         # Convert lists to NumPy arrays just before GPU call
         # Check for shape consistency (assuming all features should have the same dim)
@@ -455,15 +636,18 @@ class HybridTracker:
             active_features_np = np.asarray(all_active_features, dtype=np.float32)
             inactive_features_np = np.asarray(all_inactive_features, dtype=np.float32)
         except ValueError as e:
-             print(f"Offline ReID Error: Could not create numpy arrays from features. Possible shape mismatch? Error: {e}")
-             return # Cannot proceed
+            if not primary_only_mode:  # Only log in full mode
+                print(f"Offline ReID Error: Could not create numpy arrays from features. Possible shape mismatch? Error: {e}")
+            return  # Cannot proceed
 
         if active_features_np.shape[0] == 0 or inactive_features_np.shape[0] == 0:
-             print("Offline ReID: Feature arrays are empty after conversion.")
-             return
+            if not primary_only_mode:  # Only log in full mode
+                print("Offline ReID: Feature arrays are empty after conversion.")
+            return
 
         # --- 2. Batch Distance Calculation using GPU ---
-        print(f"Offline ReID: Calculating distances between {active_features_np.shape[0]} active and {inactive_features_np.shape[0]} inactive features using GPU.")
+        if not primary_only_mode:  # Only log in full mode
+            print(f"Offline ReID: Calculating distances between {active_features_np.shape[0]} active and {inactive_features_np.shape[0]} inactive features using GPU.")
 
         full_distance_matrix = compute_cosine_distance_gpu(
             active_features_np,
@@ -473,17 +657,28 @@ class HybridTracker:
 
         # Check if GPU calculation failed (e.g., returned empty)
         if full_distance_matrix is None or full_distance_matrix.size == 0 or full_distance_matrix.shape != (active_features_np.shape[0], inactive_features_np.shape[0]):
-            print("Offline ReID: GPU distance calculation failed or returned unexpected result. Skipping merge for this frame.")
-            return # Abort merge if distance calculation failed
+            if not primary_only_mode:  # Only log in full mode
+                print("Offline ReID: GPU distance calculation failed or returned unexpected result. Skipping merge for this frame.")
+            return  # Abort merge if distance calculation failed
 
-        print("Offline ReID: GPU distance calculation complete.")
+        if not primary_only_mode:  # Only log in full mode
+            print("Offline ReID: GPU distance calculation complete.")
 
         # --- 3. Extract Minimums and Build Merge Candidates ---
         merge_candidates = []
-        merge_threshold = 0.2 # Your similarity threshold (applied AFTER distance calculation)
+        
+        # Adjust thresholds based on mode
+        merge_threshold = 0.2  # Default threshold
+        # For primary-only mode, we can be more lenient about matches
+        if primary_only_mode:
+            merge_threshold = 0.25  # Be slightly more lenient for primary object
 
-        for id1 in valid_active_ids: # Iterate through ACTIVE track IDs that had features
-            indices1 = active_feature_indices.get(id1) # Use .get for safety
+        for id1 in valid_active_ids:  # Iterate through ACTIVE track IDs that had features
+            # If in primary-only mode, make sure we only process primary ID
+            if primary_only_mode and id1 != self.primary_object_id:
+                continue
+                
+            indices1 = active_feature_indices.get(id1)  # Use .get for safety
             if not indices1: continue
 
             # Get latest position of active track for spatial check
@@ -491,10 +686,10 @@ class HybridTracker:
             if id1 in self.track_history and len(self.track_history[id1]) > 0:
                 active_track_pos = self.track_history[id1][-1]  # Last position (x, y)
 
-            for id2 in valid_inactive_ids: # Iterate through INACTIVE track IDs that had features
-                if id1 == id2: continue # Cannot merge with self
+            for id2 in valid_inactive_ids:  # Iterate through INACTIVE track IDs that had features
+                if id1 == id2: continue  # Cannot merge with self
 
-                indices2 = inactive_feature_indices.get(id2) # Use .get for safety
+                indices2 = inactive_feature_indices.get(id2)  # Use .get for safety
                 if not indices2: continue
 
                 # Spatial check - compare last track positions (if available)
@@ -519,7 +714,9 @@ class HybridTracker:
                     if inactive_bbox and active_bbox:
                         iou = self._calculate_iou(inactive_bbox, active_bbox)
                         # If IoU is too low, skip this pair (objects are spatially too different)
-                        if iou < self.iou_threshold:
+                        # In primary-only mode, use a more lenient threshold
+                        iou_threshold = self.iou_threshold * 0.8 if primary_only_mode else self.iou_threshold
+                        if iou < iou_threshold:
                             skip_this_pair = True
                     
                     if skip_this_pair:
@@ -529,10 +726,11 @@ class HybridTracker:
                 try:
                     sub_matrix = full_distance_matrix[np.ix_(indices1, indices2)]
                 except IndexError as e:
-                    print(f"Offline ReID Error: Indexing failed for id1={id1}, id2={id2}. Indices1={indices1}, Indices2={indices2}, MatrixShape={full_distance_matrix.shape}. Error: {e}")
-                    continue # Skip this pair
+                    if not primary_only_mode:  # Only log in full mode
+                        print(f"Offline ReID Error: Indexing failed for id1={id1}, id2={id2}. Indices1={indices1}, Indices2={indices2}, MatrixShape={full_distance_matrix.shape}. Error: {e}")
+                    continue  # Skip this pair
 
-                if sub_matrix.size == 0: continue # No valid feature pairs between these IDs
+                if sub_matrix.size == 0: continue  # No valid feature pairs between these IDs
 
                 # Find the minimum distance within this specific ID-pair's features
                 min_distance = np.min(sub_matrix)
@@ -541,47 +739,55 @@ class HybridTracker:
                 if min_distance < merge_threshold:
                     merge_candidates.append((id1, id2, min_distance))
 
-        # --- 4. Resolve Merge Candidates (Same as your original code) ---
-        merge_candidates.sort(key=lambda x: x[2]) # Sort by distance (ascending)
+        # --- 4. Resolve Merge Candidates ---
+        merge_candidates.sort(key=lambda x: x[2])  # Sort by distance (ascending)
         merged_inactive = set()
-        final_merges = {} # {inactive_id_to_remove: active_id_to_keep}
+        final_merges = {}  # {inactive_id_to_remove: active_id_to_keep}
 
         for active_id, inactive_id, score in merge_candidates:
             if inactive_id not in merged_inactive and active_id not in final_merges.values():
-                 print(f"Offline ReID: Merging inactive ID {inactive_id} into active ID {active_id} (distance: {score:.4f})")
-                 final_merges[inactive_id] = active_id
-                 merged_inactive.add(inactive_id)
+                if not primary_only_mode:  # Only log in full mode
+                    print(f"Offline ReID: Merging inactive ID {inactive_id} into active ID {active_id} (distance: {score:.4f})")
+                final_merges[inactive_id] = active_id
+                merged_inactive.add(inactive_id)
 
         # --- 5. Apply the Merges ---
-        if final_merges:
+        if final_merges and not primary_only_mode:  # Only log in full mode
             print(f"Offline ReID: Applying {len(final_merges)} merges.")
+            
         for remove_id, keep_id in final_merges.items():
             # Ensure both IDs still exist in relevant structures before proceeding
             if remove_id not in self.feature_gallery or keep_id not in self.feature_gallery:
-                 print(f"Offline ReID Warning: Cannot merge {remove_id} into {keep_id}. One or both galleries missing (perhaps already merged?).")
-                 continue
+                if not primary_only_mode:  # Only log in full mode
+                    print(f"Offline ReID Warning: Cannot merge {remove_id} into {keep_id}. One or both galleries missing (perhaps already merged?).")
+                continue
 
             # Merge feature galleries
-            features_to_add = self.feature_gallery[remove_id] # deque
-            target_gallery = self.feature_gallery[keep_id] # deque
+            features_to_add = self.feature_gallery[remove_id]  # deque
+            target_gallery = self.feature_gallery[keep_id]  # deque
 
             target_feature_shape = None
             for f in target_gallery:
-                 if isinstance(f, np.ndarray):
-                     target_feature_shape = f.shape
-                     break
+                if isinstance(f, np.ndarray):
+                    target_feature_shape = f.shape
+                    break
             if target_feature_shape is None and features_to_add:
-                 # If target is empty, try to get shape from source
-                 for f in features_to_add:
-                      if isinstance(f, np.ndarray):
-                           target_feature_shape = f.shape
-                           break
+                # If target is empty, try to get shape from source
+                for f in features_to_add:
+                    if isinstance(f, np.ndarray):
+                        target_feature_shape = f.shape
+                        break
 
             added_count = 0
-            for feature in list(features_to_add): # Iterate over a copy
-                 if isinstance(feature, np.ndarray) and (target_feature_shape is None or feature.shape == target_feature_shape):
-                     target_gallery.append(feature)
-                     added_count += 1
+            for feature in list(features_to_add):  # Iterate over a copy
+                if isinstance(feature, np.ndarray) and (target_feature_shape is None or feature.shape == target_feature_shape):
+                    # If this is the primary object, always update its features
+                    if keep_id == self.primary_object_id:
+                        self.primary_object_features.append(feature)
+                        self._primary_features_need_update = True
+                    
+                    target_gallery.append(feature)
+                    added_count += 1
 
             # Update last seen frame
             self.last_seen_frame[keep_id] = max(
@@ -780,50 +986,20 @@ class HybridTracker:
         )
 
     @profile_function
-    def _get_feature_from_track(self, frame, track_object, bbox_ltrb):
-        """Extract features from track object"""
-        # Try to get feature from DeepSORT first
-        if track_object.features and isinstance(track_object.features[-1], np.ndarray):
-            return track_object.features[-1]
+    def _get_feature_from_track(self, frame, track_object, bbox_ltrb, mask_tensor=None):
+        """Extract features from track object, using mask if provided."""
+        # Try to get feature from DeepSORT first (if it stores them, though we are replacing with DINOv2)
+        # if track_object and hasattr(track_object, 'features') and track_object.features and isinstance(track_object.features[-1], np.ndarray):
+        #     return track_object.features[-1] # This is DeepSORT's own feature, not DINOv2
         
-        # If not available, extract manually
-        if bbox_ltrb[2] <= bbox_ltrb[0] or bbox_ltrb[3] <= bbox_ltrb[1]:
+        # If not available or we want DINOv2, extract manually
+        if bbox_ltrb[2] <= bbox_ltrb[0] or bbox_ltrb[3] <= bbox_ltrb[1]: # x2 <= x1 or y2 <= y1
             return None  # Early return for invalid bbox
             
-        # Extract single feature
-        x1, y1, x2, y2 = map(int, bbox_ltrb)
-            
-        # Add boundary checks to prevent out-of-bounds errors
-        height, width = frame.shape[:2]
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(width, x2)
-        y2 = min(height, y2)
-            
-        # Early return if crop would be too small
-        if x2 - x1 < 3 or y2 - y1 < 3:
-            return None
-            
-        # Use array slicing directly instead of creating temporary variables when possible
-        with torch.no_grad():  # Ensure no gradients computed
-            # Convert crop directly to tensor without intermediate PIL conversion
-            # This avoids extra memory allocations
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                return None
-                
-            # Only convert color if needed
-            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(crop)
-            
-            # Use the feature extractor's transform and model directly
-            img_tensor = self.feature_extractor.transform(img).unsqueeze(0)
-            
-            # Move to GPU only once
-            img_tensor = img_tensor.to(self.feature_extractor.device, non_blocking=True)
-            
-            # Get feature and normalize in one step if possible
-            feature = self.feature_extractor.model(img_tensor)
-            feature = F.normalize(feature, p=2, dim=1).cpu().numpy()[0]
-            
-            return feature
+        # Extract single feature using the batch extractor (with a batch of 1)
+        # The mask_tensor should correspond to this specific bbox_ltrb
+        features = self.feature_extractor.extract_features_batch(frame, [bbox_ltrb], [mask_tensor])
+        
+        if features and features[0] is not None and np.any(features[0]):
+            return features[0]
+        return None
