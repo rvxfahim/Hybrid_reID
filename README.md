@@ -2,7 +2,7 @@
 
 ## MOT Challenge demo
 
-![tracking demo video](https://github.com/rvxfahim/Hybrid_reID/raw/refs/heads/seg_mask/output.mp4)
+<video src="output.mp4" controls width="600"></video>
 Scenario used from MOT challenge MOT16-06-raw.
 
 ## Overview
