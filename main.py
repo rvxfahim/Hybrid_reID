@@ -32,7 +32,7 @@ def main():
     setup_signal_handler()
     
     # Initialize video capture - handle WSL path issues
-    video_path = "./left_view.mp4"  # Default path
+    video_path = "./MOT_edited.mp4"  # Default path
     
     # If still not found, use webcam
     if not os.path.exists(video_path):
@@ -70,17 +70,17 @@ def main():
         detector = create_mock_detector(cap)
     
     # Calculate max_age for occlusion handling
-    final_max_age = calculate_max_age_from_fps(fps, target_occlusion_seconds=10)
+    final_max_age = calculate_max_age_from_fps(fps, target_occlusion_seconds=6)
     
     # Initialize tracker
     tracker = HybridTracker(
-        max_cosine_distance=0.25,      # Reduced threshold for DINOv2 features
-        nn_budget=2000,                # Keep or increase if memory allows
+        max_cosine_distance=0.15,      # Reduced threshold for DINOv2 features
+        nn_budget=50,                # Keep or increase if memory allows
         max_age=final_max_age,         # Use dynamically calculated max_age
-        min_confidence=0.3,
+        min_confidence=0.5,
         re_id_interval=1,              # Set to run re-ID frequently since DINOv2 is powerful
-        gallery_size=1000,             # Keep or increase if needed
-        iou_threshold=0.1              # Adjust based on testing
+        gallery_size=50,             # Keep or increase if needed
+        iou_threshold=0.05              # Adjust based on testing
     )
     
     # Define color for ID1 (primary object)

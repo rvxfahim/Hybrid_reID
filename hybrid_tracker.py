@@ -879,21 +879,22 @@ class HybridTracker:
             # If IoU is extremely low and not much time has passed, reject as primary object
             frames_since_last_seen = self.frame_count - self.primary_object_last_seen
             if iou < 0.1 and frames_since_last_seen < 30:  # Adjust thresholds as needed
-                return False
-
-        # Cache for primary object features tensor
+                return False        # Cache for primary object features tensor
         if not hasattr(self, '_primary_features_tensor_cache') or self._primary_features_need_update:
             # Convert features to tensor only when primary features change
             features2 = list(self.primary_object_features)
-            self._primary_features_tensor = torch.tensor(features2, dtype=torch.float32).cuda()
+            # First convert to a single numpy array, then to a tensor to avoid the slow list conversion warning
+            features2_np = np.array(features2, dtype=np.float32)
+            self._primary_features_tensor = torch.from_numpy(features2_np).cuda()
             self._primary_features_norm = F.normalize(self._primary_features_tensor, p=2, dim=1)
             self._primary_features_need_update = False
-        
-        # Convert current feature to tensor (can't avoid this one-time conversion)
+          # Convert current feature to tensor (can't avoid this one-time conversion)
         if isinstance(current_feature, np.ndarray):
-            features1_tensor = torch.tensor([current_feature], dtype=torch.float32).cuda()
+            # Convert using from_numpy for better performance
+            features1_tensor = torch.from_numpy(current_feature[np.newaxis, :].astype(np.float32)).cuda()
         else:
-            features1_tensor = torch.tensor(current_feature, dtype=torch.float32).unsqueeze(0).cuda()
+            # Assume it's already in a format that can be converted directly
+            features1_tensor = torch.from_numpy(np.array(current_feature, dtype=np.float32)[np.newaxis, :]).cuda()
         
         # Normalize features
         features1_norm = F.normalize(features1_tensor, p=2, dim=1)

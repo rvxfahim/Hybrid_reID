@@ -29,7 +29,7 @@ class YOLODetector:
             if model_path is None:
                 # User should ensure 'yolov8n-seg.pt' or their desired segmentation model is available
                 print("Attempting to load default segmentation model: yolov8n-seg.pt")
-                self.model = YOLO("yolo11n-seg.pt").to(self.device)
+                self.model = YOLO("yolov8n-seg.pt").to(self.device)
             else:
                 print(f"Loading specified model: {model_path}")
                 self.model = YOLO(model_path).to(self.device)
