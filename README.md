@@ -1,5 +1,9 @@
 # Hybrid Long-Term Multi-Object Tracking (HLT-MOT)
 
+## MOT Challenge demo
+
+[tracking demo video](output.mp4) scenario used from MOT challenge MOT16-06-raw.
+
 ## Overview
 
 This project implements a robust multi-object tracking system designed to maintain consistent object identities over extended periods, particularly addressing challenges like occlusions and re-appearance. It combines the efficiency of short-term tracking with the discriminative power of deep learning-based re-identification (Re-ID).

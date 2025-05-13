@@ -174,12 +174,13 @@ def main():
             primary_status += "LOST"
             cv2.putText(display_frame, primary_status, (10, 120), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-        
-        # Initialize video writer on first frame if saving
+          # Initialize video writer on first frame if saving
         if save_video and video_writer is None:
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            video_writer = cv2.VideoWriter('output.avi', fourcc, 30.0, 
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # MP4 codec
+            output_path = 'output.mp4'  # Change extension to mp4
+            video_writer = cv2.VideoWriter(output_path, fourcc, 30.0, 
                                           (frame.shape[1], frame.shape[0]))
+            print(f"Saving video to: {output_path}")
         
         # Write frame if saving
         if save_video and video_writer is not None:
