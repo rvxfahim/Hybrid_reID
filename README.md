@@ -2,7 +2,8 @@
 
 ## MOT Challenge demo
 
-[tracking demo video](output.mp4) scenario used from MOT challenge MOT16-06-raw.
+![tracking demo video](https://github.com/rvxfahim/Hybrid_reID/raw/refs/heads/seg_mask/output.mp4)
+Scenario used from MOT challenge MOT16-06-raw.
 
 ## Overview
 
