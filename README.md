@@ -2,7 +2,7 @@
 
 ## MOT Challenge demo
 
-https://github.com/user-attachments/assets/fa1db40b-f492-42c0-a0fd-822d0cd9dab9
+https://github.com/user-attachments/assets/13a615f8-3575-42d9-8daf-2fd5e04c2262
 
 Scenario used from MOT challenge MOT16-06-raw.
 
