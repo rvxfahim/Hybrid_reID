@@ -1,0 +1,28 @@
+@startuml output_pipeline
+skinparam componentStyle rectangle
+skinparam arrowColor black
+skinparam backgroundColor white
+skinparam componentBackgroundColor lightskyblue
+skinparam storageBackgroundColor lightyellow
+
+title Detailed View: Output
+
+frame "Output" {
+  [Visualization] as Visualization
+  storage "Video\nOutput" as VideoOutput
+  storage "Performance\nStats" as Stats
+}
+
+' Connections from outside (conceptual)
+entity "Video Frame" as Frame_Input
+entity "Active Tracks" as Tracks_Input
+entity "Primary Object Tracker Data" as PrimaryTracker_Input
+
+' Output flow
+Frame_Input --> Visualization : background
+Tracks_Input --> Visualization : draw bounding boxes
+PrimaryTracker_Input --> Visualization : highlight primary
+Visualization --> VideoOutput : save
+Visualization --> Stats : metrics
+
+@enduml

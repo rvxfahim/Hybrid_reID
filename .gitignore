@@ -1,38 +1,54 @@
-yolov8n.pt
-dl_model.py
-PlantUML_Language_Reference_Guide_en.pdf
-test_cude.py
-video.mp4
-yolo11n.pt
-yolo11s.pt
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-27-51/left_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-27-51/right_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-33-19/left_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-33-19/right_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-33-53/left_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-33-53/right_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-38-27/left_view_max_age120_max_output.avi
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-38-27/left_view_output.avi
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-38-27/left_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-38-27/right_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-40-25/left_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-40-25/right_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-54-28/left_view.mp4
-OneDrive_1_5-3-2025/HD1080_SN37677146_12-54-28/right_view.mp4
-__pycache__/botsort_tracker.cpython-310.pyc
-__pycache__/cuda_optimizations.cpython-310.pyc
-__pycache__/cupy_optimizations.cpython-310.pyc
-__pycache__/feature_extractor.cpython-310.pyc
-__pycache__/hybrid_tracker.cpython-310.pyc
-__pycache__/multithreaded_detector.cpython-310.pyc
-__pycache__/numba_optimizations.cpython-310.pyc
-__pycache__/profiling.cpython-310.pyc
-__pycache__/utils.cpython-310.pyc
-__pycache__/yolo_detector.cpython-310.pyc
-MOT_edited.mp4
-MOT.mp4
-MOT16-06-raw.webm
-output_botsort.avi
-output_hybrid.avi
-video2.mp4
-video3.mp4
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# Virtual environment
+.env
+.venv
+env/
+venv/
+ENV/
+VENV/
+*/.Python
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Data files - you might want to un-comment and specify if you have large data files
+# data/
+data/OneDrive_1_5-3-2025/
+
+# Model files - you might want to un-comment and specify if you have large model files
+models/
+
+# Output files - you might want to un-comment and specify if you have large output files
+# output/
+# runs/
+
+# Profiling files
+# profiling/
+
+# Compiled files / Logs
+*.log
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+
+# Tools - if they are executables or large binaries you might not want to commit
+# tools/plantuml-1.2025.3.jar

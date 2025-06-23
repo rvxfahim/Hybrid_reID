@@ -1,0 +1,33 @@
+@startuml input_detection_feature_pipeline
+top to bottom direction
+skinparam componentStyle rectangle
+skinparam arrowColor black
+skinparam backgroundColor white
+skinparam componentBackgroundColor lightskyblue
+skinparam databaseBackgroundColor lightgreen
+
+frame "Input" {
+  [Video Source] as VideoSource
+  [Video Frame] as Frame
+}
+
+frame "Detection" {
+  [YOLO Detector] as YOLODetector
+  database "Detection\nResults" as Detections
+}
+
+frame "Feature\nExtraction" {
+  [DINOv2 Feature Extractor] as FeatureExtractor
+  database "Current\nFrame\nFeatures" as Features
+}
+
+' Data flows
+VideoSource --> Frame : reads
+Frame --> YOLODetector : input
+YOLODetector --> Detections : produces
+Frame --> FeatureExtractor : input
+Detections --> FeatureExtractor : crop regions
+FeatureExtractor --> Features : extracts
+
+@enduml
+
