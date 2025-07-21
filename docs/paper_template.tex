@@ -8,6 +8,17 @@
 \usepackage{textcomp}
 \usepackage{xcolor}
 \usepackage{svg}
+\usepackage{url}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    filecolor=magenta,      
+    urlcolor=black,
+    pdftitle={Hybrid Long-Term Multi Object Tracking (HLT-MOT) System},
+    pdfpagemode=FullScreen,
+    citecolor=black,
+    }
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 \begin{document}
@@ -34,14 +45,14 @@ bjoern.schaefer@fh-dortmund.de}
 \IEEEauthorblockA{\textit{Department of Information Technology} \\
 \textit{FH Dortmund}\\
 Dortmund, Germany \\
-hugues.tchouankem@fh
-dortmund.de}
+hugues.tchouankem@fh-dortmund.de}
 }
 
 \maketitle
 
 \begin{abstract}
 This paper presents a Hybrid Long-Term Object Tracking (HLT-MOT) system that effectively addresses the challenges of maintaining object identities over extended periods, particularly during occlusions or temporary disappearances. Our approach combines DeepSORT's frame-to-frame tracking capabilities with a robust re-identification framework powered by DINOv2 deep learning model. The system maintains feature galleries for tracked objects and employs both online and offline re-identification strategies to recover lost identities. Key innovations include: (1) a dual-model approach that balances accuracy and computational efficiency, (2) GPU-accelerated batch processing for feature extraction and matching, (3) Numba-optimized spatial-temporal consistency checks, and (4) dedicated mechanisms for prioritized tracking of a primary object. Experimental results demonstrate that our system significantly outperforms traditional tracking approaches in challenging scenarios involving long-term occlusions, crowded scenes, and appearance changes, while maintaining near real-time performance. The HLT-MOT system has important applications in surveillance, autonomous navigation, and human-computer interaction domains where persistent identity tracking is essential.
+We open source our code with a demo video at \url{https://github.com/rvxfahim/Hybrid_reID} \href{https://github.com/rvxfahim/Hybrid_reID}{Hybrid reID}.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -49,12 +60,11 @@ Multi-Object Tracking, Long-Term Tracking, Re-identification, DeepSORT, Feature 
 \end{IEEEkeywords}
 
 \section{Introduction}
-Robust, long-term person tracking is a cornerstone of intelligent systems in a multitude of applications, from human-robot collaboration and autonomous navigation to security and surveillance. The fundamental challenge lies not merely in following a person in an uncluttered view, but in maintaining a consistent identity through complex, real-world scenarios. These scenarios are characterized by frequent and prolonged occlusions, significant variations in appearance due to changing viewpoints and lighting, and the presence of visually similar distractors. Traditional tracking systems, which often couple a detector like YOLO \cite{7780460} with a motion-centric tracker such as DeepSORT \cite{Wojke2017simple,Wojke2018deep}, perform well in short-term scenarios but often fail when an object reappears after a long absence, as their underlying feature representations lack the robustness to bridge significant appearance gaps \cite{10623162}. The recent emergence of large-scale, self-supervised foundation models has signified a new direction in visual perception, facilitating exceptional performance on open-set identification challenges. Works such as "Follow Anything" \cite{maalouf2023follow} have demonstrated the power of models like DINO \cite{DBLP:journals/corr/abs-2104-14294} and SAM \cite{10378323} to track arbitrary objects specified by a user query in real-time. Inspired by this progress, our work specializes these powerful representations for the specific and demanding task of long-term person re-identification (Re-ID). In this paper, we present a hybrid, real-time person tracking and re-identification system designed for long-term identity persistence. Our system synergistically combines the motion-prediction efficiency of DeepSORT for short-term tracking with a powerful appearance-based re-identification module built upon the DINOv2 \cite{oquab2023dinov2,darcet2023vitneedreg,jose2024dinov2meetstextunified} vision transformer. The core of our approach lies in a mask-aware feature extraction pipeline. By leveraging a segmentation-capable detector (YOLOv8-Seg) \cite{Jocher_Ultralytics_YOLO_2023,10533619}, our system extracts discriminative features exclusively from the pixels of the segmented person, rather than the entire bounding box. This technique significantly improves feature quality and robustness against background clutter, a common failure point for traditional Re-ID methods. To ensure real-time applicability, the entire system is heavily optimized, employing TensorRT-accelerated \cite{nvidia_tensorrt} detection, batched GPU computations for feature extraction, and Numba-accelerated CPU operations.\\
+Robust, long-term person tracking is a cornerstone of intelligent systems in a multitude of applications, from human-robot collaboration and autonomous navigation to security and surveillance. The fundamental challenge lies not merely in following a person in an uncluttered view, but in maintaining a consistent identity through complex, real-world scenarios. These scenarios are characterized by frequent and prolonged occlusions, significant variations in appearance due to changing viewpoints and lighting, and the presence of visually similar distractors. Traditional tracking systems, which often couple a detector like YOLO \cite{7780460} with a motion-centric tracker such as DeepSORT \cite{Wojke2017simple,Wojke2018deep}, perform well in short-term scenarios but often fail when an object reappears after a long absence, as their underlying feature representations lack the robustness to bridge significant appearance gaps \cite{10623162}. The recent emergence of large-scale, self-supervised foundation models has signified a new direction in visual perception, facilitating exceptional performance on open-set identification challenges. Works such as "Follow Anything" \cite{maalouf2023follow} have demonstrated the power of models like DINO \cite{DBLP:journals/corr/abs-2104-14294} and SAM \cite{10378323} to track arbitrary objects specified by a user query in real-time. Inspired by this progress, our work specializes these powerful representations for the specific and demanding task of long-term person re-identification (Re-ID). In this paper, we present a hybrid, real-time person tracking and re-identification system designed for long-term identity persistence. Our system synergistically combines the motion-prediction efficiency of DeepSORT for short-term tracking with a powerful appearance-based re-identification module built upon the DINOv2 \cite{oquab2023dinov2,darcet2023vitneedreg,jose2024dinov2meetstextunified} vision transformer. The core of our approach lies in a mask-aware feature extraction pipeline. By leveraging a segmentation-capable detector (YOLOv8-Seg) \cite{Jocher_Ultralytics_YOLO_2023,10533619}, our system extracts discriminative features exclusively from the pixels of the segmented person, rather than the entire bounding box. This technique significantly improves feature quality and robustness against background clutter, a common failure point for traditional Re-ID methods \cite{Seong_2023}. To ensure real-time applicability, the entire system is heavily optimized, employing TensorRT-accelerated \cite{nvidia_tensorrt} detection, batched GPU computations for feature extraction, and Numba-accelerated\cite{10.1145/2833157.2833162} CPU operations.\\
 \textit{Our main contributions are:}
 A hybrid tracking architecture that integrates the motion-based tracking of DeepSORT with a robust DINOv2-based appearance gallery for long-term re-identification.
 A mask-aware feature extraction pipeline that utilizes segmentation masks to generate superior, clutter-free appearance descriptors for person Re-ID.
 An end-to-end, real-time optimized system that demonstrates effective long-term tracking of a primary individual through significant occlusions and appearance changes.
-
 \section{Related Work}
 The challenge of robust, long-term multi-object tracking (MOT) has been approached from several angles, evolving from motion-based methods to sophisticated deep learning architectures. Our work builds upon these established principles by integrating recent advances in self-supervised learning to address the specific demands of long-term person re-identification (Re-ID).
 \subsection{Tracking-by-Detection and DeepSORT}
@@ -68,11 +78,11 @@ Works like "Follow Anything" (FAn) by Maalouf et al. \cite{maalouf2023follow} ha
 \subsection{Mask-Aware Feature Extraction}
 A key challenge in appearance-based tracking is the presence of background clutter within an object's bounding box, which can corrupt the feature vector. To mitigate this, some approaches utilize mask-aware feature extraction. By employing segmentation-capable detectors like YOLOv8-Seg \cite{Jocher_Ultralytics_YOLO_2023,10533619}, it is possible to obtain precise pixel-level masks for each person. This allows feature extractors to compute embeddings exclusively from the pixels corresponding to the person, effectively reducing background noise. This principle, also seen in the FAn system's use of SAM \cite{maalouf2023follow}, significantly enhances the discriminative power of appearance features, which is crucial for distinguishing between individuals in crowded environments.
 \section{System Architecture}
-The HLT-MOT system is designed as a modular, multi-stage pipeline that processes video frames to achieve robust long-term object tracking. The architecture's core principle is to synergize a high-speed, short-term tracker with a computationally intensive but highly accurate long-term re-identification (Re-ID) module. This dual approach allows the system to maintain track continuity in real-time while effectively recovering identities after prolonged occlusions or scene re-entry. The overall data flow is illustrated in Figure~\ref{fig:pipeline_overview}.
+The HLT-MOT system is designed as a modular, multi-stage pipeline that processes video frames to achieve robust long-term object tracking. The architecture's core principle is to synergize a high-speed, short-term tracker with a computationally intensive but highly accurate long-term re-identification (Re-ID) module. This dual approach allows the system to maintain track continuity in real-time while effectively recovering identities after prolonged occlusions or scene re-entry. The overall data flow is illustrated in Fig.~\ref{fig:pipeline_overview}.
 
 \begin{figure}[htbp]
   \centering
-  \includegraphics[width=\columnwidth]{diagrams/overview_pipeline_diagram0-plantuml-svg-converted-to.pdf}
+  \scalebox{0.6}{\includegraphics[width=\columnwidth]{diagrams/overview_pipeline_diagram0-plantuml-svg-converted-to.pdf}}
   \caption{High-level overview of the HLT-MOT system pipeline, from input frame to tracked output.}
   \label{fig:pipeline_overview}
 \end{figure}
@@ -84,7 +94,7 @@ The tracking process is executed through a sequence of specialized components fo
 The pipeline begins with the YOLODetector, which processes the input frame to identify all persons and generate precise pixel-level segmentation masks for each one.
 
 \subsubsection{Appearance Feature Extraction}
-For each valid detection, the FeatureExtractor generates a discriminative appearance embedding. As shown in Figure, this process is mask-aware, using the segmentation mask to crop the person and isolate their features from background clutter, significantly improving the quality of the embedding.
+For each valid detection, the FeatureExtractor generates a discriminative appearance embedding. As shown in Fig.~\ref{fig:feature_pipeline}, this process is mask-aware, using the segmentation mask to crop the person and isolate their features from background clutter, significantly improving the quality of the embedding.
 
 \begin{figure}[htbp]
 \centering
@@ -97,7 +107,7 @@ For each valid detection, the FeatureExtractor generates a discriminative appear
 The detections, along with their spatial and appearance information, are passed to an integrated DeepSORT tracker. DeepSORT excels at frame-to-frame association using motion prediction and appearance cues, making it highly effective for maintaining identities through smooth trajectories and brief occlusions.
 
 \subsubsection{Long-Term Re-identification}
-The HybridTracker orchestrates the entire process and manages the crucial long-term Re-ID logic, as depicted in figure. It maintains a gallery of appearance embeddings for each object. When a track is lost and a new object appears, the HybridTracker compares the new object's features against the galleries of lost tracks. If a strong match is found, the object's original identity is recovered, bridging long temporal gaps caused by extended occlusions or the object leaving and re-entering the scene.
+The HybridTracker orchestrates the entire process and manages the crucial long-term Re-ID logic, as depicted in Fig.~\ref{fig:tracking_pipeline}. It maintains a gallery of appearance embeddings for each object. When a track is lost and a new object appears, the HybridTracker compares the new object's features against the galleries of lost tracks. If a strong match is found, the object's original identity is recovered, bridging long temporal gaps caused by extended occlusions or the object leaving and re-entering the scene.
 
 \begin{figure}[htbp]
 \centering
@@ -133,7 +143,7 @@ This class is the brain of the system, orchestrating the entire tracking and re-
     \item \textbf{Feature Gallery:} Its central data structure is the \texttt{feature\_gallery}, which stores a \texttt{deque} (a fixed-size queue) of the most recent DINOv2 feature vectors for each long-term ID. This gallery serves as the memory of each object's appearance over time.
     \item \textbf{Re-identification Logic:} Re-ID is handled through a two-pronged approach. First, an \textit{online} Re-ID check occurs whenever a new, untracked object appears. Its features are compared against the galleries of recently vanished tracks (\texttt{inactive\_ids}) to see if it's a reappearance. Second, a more comprehensive \textit{offline} Re-ID process (\texttt{\_perform\_offline\_reid}) runs periodically. This function compares all active tracks with all inactive tracks using a batched GPU-based cosine distance calculation, allowing it to merge track fragments that belong to the same identity but were separated by a longer occlusion.
     \item \textbf{Spatial-Temporal Consistency:} Beyond appearance similarity, spatial and temporal cues are also considered. If the features are similar, it then enforces a spatial constraint. It checks if the new detection is physically close to the last known location of the lost track. This implementation choice effectively reduces false positives in Re-ID by using a search radius based on the last known position of the object and helps in crowded scenes where multiple objects may have similar appearances.
-    \item \textbf{Primary Object Focus:} The tracker implements specialized logic to maintain the identity of a designated \texttt{primary\_object\_id}. This includes focused feature extraction for this specific target, making the system particularly suitable for applications like person-following where one object is of critical importance.
+    \item \textbf{Primary Object Focus:} The pipeline is designed to prioritize a designated "primary object". For simplicity, the current implementation defaults to the first object detected. However, many different ways can accommodate a user-selection mechanism (e.g., a mouse click, bounding box, etc.) or other designation methods through a minimal software layer.
 \end{itemize}
 
 \section{Optimization Techniques}
@@ -163,22 +173,26 @@ Constant feature extraction for every detected object is computationally wastefu
 
 \section{Evaluation}
 To evaluate the performance of the HLT-MOT system, we tested the system on one of the standard multi-object tracking benchmark video called MOT16-06\cite{milan2016mot16benchmarkmultiobjecttracking,lealtaixé2015motchallenge2015benchmarkmultitarget}. The evaluation focused on tracking performance under various conditions, including occlusions, crowded scenes, and appearance changes.
-We manually block the other individuals in the first frame to have a lock on the primary object before letting the original frames pass through the tracker. Since the system uses the first person it detects as the primary object, it could be automated as an interactive feature, like letting a user click to choose the target. A collage of a few intermediate video frames is shown in Figure 5, demonstrating how the system preserves the identity of the main object through reappearances and occlusions. Later in the video, as the lighting changes, the same person experiences another occlusion caused by several people passing in front of the main object.
 \begin{figure}[htbp]
 \centering
 \scalebox{0.28}{\includegraphics{../src/output/set1/collage.pdf}}
 \caption{From top left and clockwise: (1) Women in white shirt and blue jeans tracked as primary, (2) Occluded by a person and tracker is lost, (3) Re-identified after reappearing}
 \label{fig:tracking_example}
 \end{figure}
-
+We manually block the other individuals in the first frame to have a lock on the primary object before letting the original frames pass through the tracker. A collage of a few intermediate video frames is shown in Fig.~\ref{fig:tracking_example}, demonstrating how the system preserves the identity of the main object through reappearances and occlusions. Later in the video, as the lighting changes, the same person experiences another occlusion caused by several people passing in front of the main object as seen in Fig.~\ref{fig:tracking_example_set2}.
 \begin{figure}[htbp]
 \centering
 \scalebox{0.28}{\includegraphics{../src/output/set2/collage.pdf}}
-\caption{From top left and clockwise: Same women in figure \ref{fig:tracking_example} tracked as primary walking and being occluded by a group of other people}
+\caption{From top left and clockwise: Same women in Fig.\ref{fig:tracking_example} tracked as primary walking and being occluded by a group of other people}
 \label{fig:tracking_example_set2}
 \end{figure}
-
-
+\begin{figure}[htbp]
+\centering
+\scalebox{0.41}{\includegraphics{../src/output/set1/nvdcf_collage.pdf}}
+\caption{NVDCF tracker failing to recover the identity of the woman}
+\label{fig:tracking_example_set1_nvdcf}
+\end{figure}
+We compare the performance of our system with another state-of-the-art tracker called NVDCF\cite{NVDCF} from NVIDIA on the same video with the dafault parameters set in the deepstream sample app. It is observed that the NVDCF tracker loses the primary object after a few frames of occlusion, and was not able to recover the identity of the primary object when it reappeared as shown in Fig~\ref{fig:tracking_example_set1_nvdcf}. In contrast, our system was able to maintain the identity of the primary object throughout the video, even after long occlusions and appearance changes.
 \bibliographystyle{IEEEtran}
 \bibliography{references}
 
