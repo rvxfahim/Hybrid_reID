@@ -79,3 +79,7 @@ docs/
 *.h5
 *.ckpt
 *.engine
+test_deepsort_yolo_realtime.py
+test_deepsort_yolo.py
+test_iou_calculation.py
+src/fps.txt
