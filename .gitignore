@@ -35,8 +35,18 @@ datasets/
 deepstream/
 tests/
 tools/
-*.webm
+
+# Video files
 *.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.m4v
+*.webm
+*.ts
+*.mts
 
 # Model files - you might want to un-comment and specify if you have large model files
 models/
