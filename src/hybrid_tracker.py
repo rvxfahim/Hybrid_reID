@@ -21,7 +21,8 @@ from utils import convert_bbox_format  # Added import for convert_bbox_format
 
 class HybridTracker:
     def __init__(self, max_cosine_distance=0.4, nn_budget=None, max_age=30, min_confidence=0.3,
-                 re_id_interval=50, gallery_size=100, iou_threshold=0.3, model_path=None):
+                 re_id_interval=50, gallery_size=100, iou_threshold=0.3, model_path=None,
+                 dino_model: str = "dinov2_vitb14_reg"):
         """
         Initialize the hybrid tracker with DeepSORT and Re-ID components
         
@@ -34,9 +35,11 @@ class HybridTracker:
             gallery_size: Maximum number of object appearances to store in the gallery
             iou_threshold: IoU threshold for association
             model_path: Path to pre-trained model for feature extraction
+            dino_model: Model name from DINO_MODEL_REGISTRY, e.g. 'dinov2_vitb14_reg',
+                        'dinov3_vitb16'. See feature_extractor.py for options.
         """
         # Initialize feature extractor
-        self.feature_extractor = FeatureExtractor(model_path)
+        self.feature_extractor = FeatureExtractor(model_path, dino_model=dino_model)
         
         # Initialize DeepSORT tracker
         self.tracker = DeepSort(

@@ -201,6 +201,11 @@ def main():
     parser.add_argument('--video-path', type=str, default='./left_view.mp4', help='Path to video file (default: ./left_view.mp4)')
     parser.add_argument('--device', type=str, default='cuda', help='Computing device (cuda or cpu, default: cuda)')
     parser.add_argument('--conf-threshold', type=float, default=0.3, help='Confidence threshold for detection (default: 0.3)')
+    parser.add_argument('--dino-model', type=str, default='dinov2_vitb14_reg',
+                        help='Feature extractor model. DINOv2: dinov2_vits14, dinov2_vitb14, '
+                             'dinov2_vitb14_reg, dinov2_vitl14, dinov2_vitg14. '
+                             'DINOv3: dinov3_vits16, dinov3_vitb16, dinov3_vitl16. '
+                             '(default: dinov2_vitb14_reg)')
     args = parser.parse_args()
     
     # Initialize the profiler at the top of main
@@ -289,7 +294,8 @@ def main():
         min_confidence=0.5,
         re_id_interval=2,              # Set to run re-ID frequently since DINOv2 is powerful
         gallery_size=5000,             # Keep or increase if needed
-        iou_threshold=0.3              # Adjust based on testing
+        iou_threshold=0.3,             # Adjust based on testing
+        dino_model=args.dino_model,
     )
 
     # --- Target selection phase ---

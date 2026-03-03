@@ -27,6 +27,7 @@ class SimpleReIDTracker:
         max_gallery_size: int = 10,
         min_confidence: float = 0.3,
         model_path=None,
+        dino_model: str = "dinov2_vitb14_reg",
     ):
         """
         Args:
@@ -34,14 +35,16 @@ class SimpleReIDTracker:
                              0 = identical, 2 = opposite).  Values <= threshold are matched.
             max_gallery_size: Number of feature vectors to keep per track ID.
             min_confidence: Minimum YOLO detection confidence to accept.
-            model_path: Optional path to a custom DINOv2 model.
+            model_path: Optional path to a custom DINOv2 model file.
+            dino_model: Model name from DINO_MODEL_REGISTRY in feature_extractor.py,
+                        e.g. 'dinov2_vitb14_reg', 'dinov3_vitb16'.
         """
         self.match_threshold = match_threshold
         self.max_gallery_size = max_gallery_size
         self.min_confidence = min_confidence
 
-        # Feature extractor (DINOv2)
-        self.feature_extractor = FeatureExtractor(model_path)
+        # Feature extractor (DINOv2 / DINOv3)
+        self.feature_extractor = FeatureExtractor(model_path, dino_model=dino_model)
         self.feature_dim = self.feature_extractor.feature_dim
 
         # Track state

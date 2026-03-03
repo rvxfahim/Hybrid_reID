@@ -15,52 +15,105 @@ from torchvision.models import ResNet50_Weights
 
 from profiling import profile_function
 
+# ---------------------------------------------------------------------------
+# Model registry
+# ---------------------------------------------------------------------------
+# Each entry: (backend, hub_repo_or_hf_id, entry_or_none, feature_dim)
+#   backend 'torch_hub' : torch.hub.load(repo, entry)
+#   backend 'hf'        : transformers AutoModel.from_pretrained(hf_id)
+# ---------------------------------------------------------------------------
+DINO_MODEL_REGISTRY = {
+    # DINOv2 – loaded via torch.hub (no local clone required)
+    "dinov2_vits14":     ("torch_hub", "facebookresearch/dinov2", "dinov2_vits14",     384),
+    "dinov2_vitb14":     ("torch_hub", "facebookresearch/dinov2", "dinov2_vitb14",     768),
+    "dinov2_vitb14_reg": ("torch_hub", "facebookresearch/dinov2", "dinov2_vitb14_reg", 768),
+    "dinov2_vitl14":     ("torch_hub", "facebookresearch/dinov2", "dinov2_vitl14",    1024),
+    "dinov2_vitg14":     ("torch_hub", "facebookresearch/dinov2", "dinov2_vitg14",    1536),
+    # DINOv3 – loaded via Hugging Face Transformers (no local clone required)
+    # https://github.com/facebookresearch/dinov3
+    "dinov3_vits16": ("hf", "facebook/dinov3-vits16-pretrain-lvd1689m", None, 384),
+    "dinov3_vitb16": ("hf", "facebook/dinov3-vitb16-pretrain-lvd1689m", None, 768),
+    "dinov3_vitl16": ("hf", "facebook/dinov3-vitl16-pretrain-lvd1689m", None, 1024),
+}
+
+DEFAULT_DINO_MODEL = "dinov2_vitb14_reg"
+
+
 class FeatureExtractor:
-    def __init__(self, model_path=None, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model_path=None, device='cuda' if torch.cuda.is_available() else 'cpu',
+                 dino_model: str = DEFAULT_DINO_MODEL):
         """
-        Initialize the feature extractor with DINOv2 model
+        Initialize the feature extractor.
 
         Args:
-            model_path: Path to a custom model (if None, use pre-trained DINOv2)
-            device: Device to run the model on ('cuda' or 'cpu')
+            model_path: Path to a fully custom saved model file (overrides dino_model).
+            device: Device to run the model on ('cuda' or 'cpu').
+            dino_model: Short name from DINO_MODEL_REGISTRY, e.g. 'dinov2_vitb14_reg'
+                        or 'dinov3_vitb16'.  Ignored when model_path is provided.
         """
         self.device = device
+        self._hf_processor = None  # set for HuggingFace-backend models
         print(f"Using device: {self.device}")
 
-        # Initialize DINOv2 model
-        try:
-            if (model_path is None or not os.path.exists(model_path)):
-                print("Loading pre-trained DINOv2 ViT-S/14 model")
-                self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
-                self.feature_dim = 768   # ViT-S/14 output dimension
-            else:
-                print(f"Loading custom model from {model_path}")
+        # ---- Custom model file takes highest priority ----------------
+        if model_path is not None and os.path.exists(model_path):
+            print(f"Loading custom model from {model_path}")
+            try:
                 self.model = torch.load(model_path, map_location=self.device)
-                # Attempt to determine feature dim from model if not specified
-                if hasattr(self.model, 'embed_dim'):
-                    self.feature_dim = self.model.embed_dim
-                else:
-                    self.feature_dim = 384  # Default to ViT-S/14 dimension
+                self.feature_dim = self.model.embed_dim if hasattr(self.model, 'embed_dim') else 384
+                self.model = self.model.to(self.device)
+                self.model.eval()
+                self._build_standard_transform()
+                print(f"Feature extractor initialized with feature dimension: {self.feature_dim}")
+                return
+            except Exception as e:
+                print(f"Error loading custom model: {e}. Falling back to registry model.")
+
+        # ---- Registry lookup ----------------------------------------
+        if dino_model not in DINO_MODEL_REGISTRY:
+            print(f"Unknown dino_model '{dino_model}'. Available: {list(DINO_MODEL_REGISTRY)}. "
+                  f"Falling back to '{DEFAULT_DINO_MODEL}'.")
+            dino_model = DEFAULT_DINO_MODEL
+
+        backend, repo_or_id, entry, feature_dim = DINO_MODEL_REGISTRY[dino_model]
+        self.feature_dim = feature_dim
+
+        try:
+            if backend == "torch_hub":
+                print(f"Loading {dino_model} via torch.hub ({repo_or_id} :: {entry})")
+                self.model = torch.hub.load(repo_or_id, entry)
+                self._build_standard_transform()
+            else:  # 'hf'
+                print(f"Loading {dino_model} via Hugging Face Transformers ({repo_or_id})")
+                from transformers import AutoImageProcessor, AutoModel
+                self._hf_processor = AutoImageProcessor.from_pretrained(repo_or_id)
+                self.model = AutoModel.from_pretrained(repo_or_id)
+                # HF models ship with their own preprocessor; no manual transform needed.
+                self.transform = None
+
+            self.model = self.model.to(self.device)
+            self.model.eval()
+
         except Exception as e:
-            print(f"Error loading DINOv2 model: {e}")
-            # Fall back to a simpler ResNet model if DINOv2 fails
+            print(f"Error loading {dino_model}: {e}")
             print("Falling back to ResNet50 model")
             self.model = torchvision.models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-            self.model = torch.nn.Sequential(*list(self.model.children())[:-1])  # Remove classification layer
-            self.feature_dim = 2048  # ResNet50 feature dimension
-        
-        self.model = self.model.to(self.device)
-        self.model.eval()
+            self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
+            self.feature_dim = 2048
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            self._build_standard_transform()
 
-        # Define image transforms for DINOv2
+        print(f"Feature extractor initialized with feature dimension: {self.feature_dim}")
+
+    def _build_standard_transform(self):
+        """Standard ImageNet transform used by DINOv2 and the ResNet fallback."""
         self.transform = transforms.Compose([
             transforms.Resize(256),
-            transforms.CenterCrop(224),  # DINOv2 expects 224x224 input
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-
-        print(f"Feature extractor initialized with feature dimension: {self.feature_dim}")
         
     @profile_function
     def extract_features_batch(self, frame, bboxes, masks=None):
@@ -125,7 +178,11 @@ class FeatureExtractor:
                 
                 # Convert crop to RGB and then to PIL Image
                 img_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                crops_transformed.append(self.transform(img_pil))
+                if self._hf_processor is not None:
+                    # HF backend: store PIL images; will batch-process below
+                    crops_transformed.append(img_pil)
+                else:
+                    crops_transformed.append(self.transform(img_pil))
                 valid_indices.append(i)
                 
             except Exception as e:
@@ -135,17 +192,23 @@ class FeatureExtractor:
         # Process all crops in a single batch
         if not crops_transformed:
             return [np.zeros(self.feature_dim, dtype=np.float32)] * len(bboxes)
-            
-        # Stack crops into a batch tensor
-        batch = torch.stack(crops_transformed).to(self.device)
-        
-        # Measure specifically the model inference time
+
         inference_start = time.time()
-        
-        # Extract features with DINOv2 in a single forward pass
-        with torch.no_grad():
-            features_batch = self.model(batch)
-            features_batch = F.normalize(features_batch, p=2, dim=1).cpu().numpy()
+
+        if self._hf_processor is not None:
+            # HuggingFace backend: use AutoImageProcessor to build pixel_values tensor
+            inputs = self._hf_processor(images=crops_transformed, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device)
+            with torch.no_grad():
+                outputs = self.model(pixel_values=pixel_values)
+                # Use pooler_output (CLS token) as the embedding
+                features_batch = F.normalize(outputs.pooler_output, p=2, dim=1).cpu().numpy()
+        else:
+            # torch.hub / standard backend
+            batch = torch.stack(crops_transformed).to(self.device)
+            with torch.no_grad():
+                features_batch = self.model(batch)
+                features_batch = F.normalize(features_batch, p=2, dim=1).cpu().numpy()
             
         # Calculate inference time
         inference_time = time.time() - inference_start

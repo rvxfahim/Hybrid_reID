@@ -64,14 +64,19 @@ def main():
     parser = argparse.ArgumentParser(description='Experimental DINOv2-only reID pipeline')
     parser.add_argument('--use-tensorrt', action='store_true')
     parser.add_argument('--model-path', type=str, default=None,
-                        help='Path to YOLO model (default: yolov8n-seg.pt)')
+                        help='Path to YOLO model (default: yolov8n.pt)')
     parser.add_argument('--video-path', type=str, default='./left_view.mp4')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--conf-threshold', type=float, default=0.3)
-    parser.add_argument('--match-threshold', type=float, default=0.15,
+    parser.add_argument('--match-threshold', type=float, default=0.3,
                         help='Cosine distance threshold for reID matching (default: 0.35)')
-    parser.add_argument('--gallery-size', type=int, default=20,
+    parser.add_argument('--gallery-size', type=int, default=100,
                         help='Number of feature vectors stored per track (default: 10)')
+    parser.add_argument('--dino-model', type=str, default='dinov2_vitb14_reg',
+                        help='Feature extractor model. DINOv2: dinov2_vits14, dinov2_vitb14, '
+                             'dinov2_vitb14_reg, dinov2_vitl14, dinov2_vitg14. '
+                             'DINOv3: dinov3_vits16, dinov3_vitb16, dinov3_vitl16. '
+                             '(default: dinov2_vitb14_reg)')
     args = parser.parse_args()
 
     profiler.enable()
@@ -131,6 +136,7 @@ def main():
         match_threshold=args.match_threshold,
         max_gallery_size=args.gallery_size,
         min_confidence=args.conf_threshold,
+        dino_model=args.dino_model,
     )
 
     # ---- Main loop ---------------------------------------------------
