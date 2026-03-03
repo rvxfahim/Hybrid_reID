@@ -68,9 +68,9 @@ def main():
     parser.add_argument('--video-path', type=str, default='./left_view.mp4')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--conf-threshold', type=float, default=0.3)
-    parser.add_argument('--match-threshold', type=float, default=0.35,
+    parser.add_argument('--match-threshold', type=float, default=0.15,
                         help='Cosine distance threshold for reID matching (default: 0.35)')
-    parser.add_argument('--gallery-size', type=int, default=10,
+    parser.add_argument('--gallery-size', type=int, default=20,
                         help='Number of feature vectors stored per track (default: 10)')
     args = parser.parse_args()
 
@@ -176,14 +176,7 @@ def main():
             cv2.putText(display_frame, f"ID:{track_id}", (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
 
-            # Trail
-            if track_id in tracker.track_history:
-                pts = list(tracker.track_history[track_id])
-                for i in range(1, len(pts)):
-                    cv2.line(display_frame,
-                             (int(pts[i-1][0]), int(pts[i-1][1])),
-                             (int(pts[i][0]),   int(pts[i][1])),
-                             colour, 2)
+
 
         # FPS
         frame_times.append(time.time() - start_time)
