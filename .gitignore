@@ -30,18 +30,27 @@ VENV/
 Thumbs.db
 
 # Data files - you might want to un-comment and specify if you have large data files
-# data/
-data/OneDrive_1_5-3-2025/
+data/
+datasets/
+deepstream/
+tests/
+tools/
+*.webm
+*.mp4
 
 # Model files - you might want to un-comment and specify if you have large model files
 models/
 
 # Output files - you might want to un-comment and specify if you have large output files
-# output/
-# runs/
+output/
+runs/
+profiling/
+docs/
+
 
 # Profiling files
 # profiling/
+*.prof
 
 # Compiled files / Logs
 *.log
@@ -52,3 +61,11 @@ models/
 
 # Tools - if they are executables or large binaries you might not want to commit
 # tools/plantuml-1.2025.3.jar
+
+# Model file extensions
+*.pt
+*.pth
+*.onnx
+*.h5
+*.ckpt
+*.engine
