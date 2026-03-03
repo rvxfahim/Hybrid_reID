@@ -78,6 +78,10 @@ class HybridTracker:
         self.primary_object_active = False  # Whether the primary object is currently being tracked
         self.primary_object_bbox = None  # Keep track of the primary object's bounding box
 
+        # Manual target selection support
+        self.waiting_for_selection = True   # Do not auto-assign primary object until user selects
+        self._pending_primary_bbox = None   # Bbox chosen by the user during the selection phase
+
         # Store current frame's detections with masks
         self.current_frame_detections_details = []
     
@@ -298,13 +302,28 @@ class HybridTracker:
 
             # Handle ID mapping
             if track_id not in self.id_mapping:
-                # First frame - assign ID1 to first detected object 
-                if self.primary_object_id is None:
+                # Assign ID1 to the first detected object, but only after the user has
+                # made a selection (waiting_for_selection == False).
+                if self.primary_object_id is None and not self.waiting_for_selection:
+                    # If the user pre-selected a bbox, pick the track whose bbox best
+                    # matches it by IoU; otherwise fall back to the first confirmed track.
+                    if self._pending_primary_bbox is not None:
+                        if NUMBA_AVAILABLE:
+                            iou = calculate_iou_numba(bbox_ltrb, self._pending_primary_bbox)
+                        else:
+                            iou = calculate_iou(bbox_ltrb, self._pending_primary_bbox)
+                        if iou < 0.1:
+                            # This track doesn't match the selected bbox; skip it for now
+                            # (do NOT assign an ID yet – retry on the next frame)
+                            continue
+                        # Good match – clear the pending bbox so we don't re-use it
+                        self._pending_primary_bbox = None
+
                     self.primary_object_id = 1
                     self.id_mapping[track_id] = self.primary_object_id
                     self.primary_object_active = True
                     primary_object_seen = True
-                    
+
                     # Set flag to initialize primary features
                     if not hasattr(self, '_primary_features_need_update'):
                         self._primary_features_need_update = True
@@ -852,6 +871,17 @@ class HybridTracker:
                 pred_pos[0].item(), 
                 pred_pos[1].item()
             )
+
+    def set_primary_object_by_bbox(self, bbox):
+        """
+        Called after the user manually selects a target in the selection phase.
+
+        Args:
+            bbox: [x1, y1, x2, y2] bounding box of the selected detection (pixel coords)
+        """
+        self._pending_primary_bbox = list(bbox)
+        self.waiting_for_selection = False
+        print(f"Target selected at bbox {[int(v) for v in bbox]}. Tracking will start on the next frame.")
 
     @profile_function
     def _is_primary_object(self, current_feature, current_bbox=None):

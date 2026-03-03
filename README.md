@@ -8,12 +8,12 @@ Scenario used from MOT challenge MOT16-06-raw.
 
 ## Overview
 
-This project implements a robust multi-object tracking system designed to maintain consistent object identities over extended periods, particularly addressing challenges like occlusions and re-appearance. It combines the efficiency of short-term tracking with the discriminative power of deep learning-based re-identification (Re-ID).
+This project implements a robust any-object tracking system designed to maintain consistent object identities over extended periods for any class from YOLO, particularly addressing challenges like occlusions and re-appearance. It combines the efficiency of short-term tracking with deep learning-based re-identification (Re-ID).
 
 **Core Functionality:**
 
 1.  **Short-Term Tracking:** Utilizes DeepSORT (`deep_sort_realtime`) for frame-to-frame association based on motion (Kalman filter) and appearance similarity (DeepSORT's internal metric).
-2.  **Appearance Embedding:** Employs DINOv2 ViT-B model (via PyTorch) to extract robust visual appearance features (768-dim embeddings) for each detected object, with ResNet50 as a fallback option.
+2.  **Appearance Embedding:** Employs DINOv2 ViT-B model (via PyTorch) to extract robust visual appearance features (768-dim embeddings) for each detected object, with ResNet50 as an alternate option.
 3.  **Primary Object Focus:** Prioritizes tracking a single "primary" object (ID 1), which is typically the first detected object in the scene.
 4.  **Online Re-Identification:** When a new track appears, its features are compared against a gallery of features from recently *inactive* tracks. If a strong match (low cosine distance) is found, the existing ID is reassigned, enabling tracking through short occlusions or detection failures.
 5.  **Offline Re-Identification Refinement:** Periodically (every `re_id_interval` frames), the system compares active tracks with inactive ones. If strong appearance similarity suggests a fragmented track (same object assigned multiple IDs), the older ID is merged into the current active one, consolidating identity history.
@@ -23,11 +23,17 @@ This project implements a robust multi-object tracking system designed to mainta
 
 ### Object Detection
 
-Object detection is the first step in our tracking pipeline, using YOLOv8/YOLOv11 (You Only Look Once), which:
+Object detection is the first step in our tracking pipeline, using YOLOv8/YOLOv11, which:
 
 1. **Divides** the image into a grid (typically 13×13 or larger)
 2. **Predicts** bounding boxes with confidence scores for each grid cell
 3. **Applies** Non-Maximum Suppression (NMS) to remove overlapping detections
+
+The system now supports TensorRT acceleration for YOLO models, which can significantly improve inference speed on compatible NVIDIA GPUs:
+
+- **Standard Mode**: Uses Ultralytics YOLO in PyTorch mode (default)
+- **TensorRT Mode**: Accelerated inference using TensorRT engine format
+- **Automatic Conversion**: Automatically converts YOLO models to TensorRT format when needed
 
 Each detection is represented as a vector `[x1, y1, x2, y2, confidence, class_id]`, where:
 - `(x1, y1)` and `(x2, y2)` are the top-left and bottom-right coordinates
@@ -65,8 +71,6 @@ A unique aspect of this implementation is its focus on tracking a primary object
 
 This approach is particularly useful for applications where tracking one specific object consistently is more important than tracking all objects.
 
-## Mathematical Components
-
 ### Intersection over Union (IoU)
 
 IoU measures the overlap between two bounding boxes and is used for spatial consistency verification:
@@ -91,59 +95,11 @@ DeepSORT combines two key components to track objects between consecutive frames
    - Updates predictions based on new measurements: `x_updated = x_predicted + K·(measurement - H·x_predicted)`
    
    Here, `F` is the state transition matrix, `H` maps state to measurement space, and `K` is the Kalman gain that balances prediction vs. measurement.
-   
-   The core Kalman filter equations implemented in DeepSORT are:
-   
-   ```math
-   \text{Prediction: } \mathbf{x}_{k|k-1} = \mathbf{F}\mathbf{x}_{k-1|k-1} + \mathbf{w}_k
-   ```
-   
-   ```math
-   \text{Update: } \mathbf{x}_{k|k} = \mathbf{x}_{k|k-1} + \mathbf{K}_k(\mathbf{z}_k - \mathbf{H}\mathbf{x}_{k|k-1})
-   ```
-   
-   With the Kalman gain:
-   ```math
-   \mathbf{K}_k = \mathbf{P}_{k|k-1}\mathbf{H}^T(\mathbf{H}\mathbf{P}_{k|k-1}\mathbf{H}^T + \mathbf{R})^{-1}
-   ```
-   
-   Where:
-   - x_k is the state vector at time k
-   - F is the state transition matrix
-   - w_k is the process noise
-   - z_k is the measurement
-   - H is the measurement matrix
-   - K_k is the Kalman gain
-   - P is the error covariance matrix
-   - R is the measurement noise covariance
 
 2. **Data Association** - Matches detections to existing tracks using both motion and appearance:
    - Computes cost matrix `C` combining motion and appearance distances
    - For each element: `C[i,j] = λ·motion_distance + (1-λ)·appearance_distance`
    - Solves the assignment problem using the Hungarian algorithm (finding optimal pairing that minimizes total cost)
-
-   The Hungarian algorithm solves the optimal assignment problem with the following mathematical formulation:
-
-   ```math
-   \min \sum_{i=1}^{n}\sum_{j=1}^{m} C_{i,j} \cdot x_{i,j}
-   ```
-
-   Subject to:
-   ```math
-   \sum_{j=1}^{m} x_{i,j} = 1 \text{ for all } i \in \{1,\ldots,n\}
-   ```
-   ```math
-   \sum_{i=1}^{n} x_{i,j} \leq 1 \text{ for all } j \in \{1,\ldots,m\}
-   ```
-   ```math
-   x_{i,j} \in \{0,1\}
-   ```
-
-   Where:
-   - n is the number of tracks
-   - m is the number of detections
-   - C is the cost matrix
-   - x_i,j = 1 if track i is assigned to detection j, 0 otherwise
 
 This combination allows reliable frame-to-frame tracking under ideal conditions.
 
@@ -314,13 +270,26 @@ Key parameters for `HybridTracker`:
 1.  **Clone:** `git clone <repository-url> && cd <repository-directory>`
 2.  **Install:** `pip install -r requirements.txt` (if provided, otherwise use the command above)
 3.  **Setup:**
-    *   Ensure YOLO model weights are available (e.g., `yolov11s.pt` will be downloaded by `ultralytics`) or configure paths in `YOLODetector`.
-    *   Place your input video as `left_view.mp4` or modify `video_path` in `main()`. Webcam 0 is used if the file isn't found.
-4.  **Run:** `python main.py`
-5.  **Interact:**
-    *   Press 'q' to quit the display window.
-    *   Press 's' to toggle saving the output video to `output.avi`.
-    *   Press 'p' to toggle per-frame profiling output.
+    *   Ensure YOLO model weights are available (e.g., `yolov8n-seg.pt` will be downloaded by `ultralytics` if not present) or configure paths in `YOLODetector`.
+    *   Place your input video as `left_view.mp4` or specify a different video using the `--video-path` argument.
+4.  **Run:**
+    * Standard mode: `python main.py`
+    * With TensorRT acceleration: `python main.py --use-tensorrt`
+    * Custom model: `python main.py --model-path yolov8n.pt`
+    * Full options:
+      ```
+      python main.py --use-tensorrt --model-path yolov8n.pt --video-path ./my_video.mp4 --device cuda --conf-threshold 0.4
+      ```
+5.  **Command-line Options:**
+    * `--use-tensorrt`: Enable TensorRT acceleration (requires CUDA)
+    * `--model-path`: Path to YOLO model (default: uses `yolov8n-seg.pt`)
+    * `--video-path`: Path to input video (default: `./left_view.mp4`)
+    * `--device`: Computing device ('cuda' or 'cpu', default: cuda)
+    * `--conf-threshold`: Detection confidence threshold (default: 0.3)
+6.  **Interact:**
+    *   Press \'q\' to quit the display window.
+    *   Press \'s\' to toggle saving the output video to `output.mp4`.
+    *   Press \'p\' to toggle per-frame profiling output.
 
 ## How the Re-ID Similarity Works: An Intuitive Explanation
 
