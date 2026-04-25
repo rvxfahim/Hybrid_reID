@@ -67,16 +67,44 @@ def main():
                         help='Path to YOLO model (default: yolov8n.pt)')
     parser.add_argument('--video-path', type=str, default='./left_view.mp4')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--conf-threshold', type=float, default=0.3)
+    parser.add_argument('--conf-threshold', type=float, default=0.6)
+    parser.add_argument('--detector', type=str, default='yolo',
+                        choices=['yolo', 'sam3', 'sam3-trt'],
+                        help='Detection frontend: "yolo" (default), "sam3" (PyTorch, text-prompted), '
+                             'or "sam3-trt" (TensorRT FP16, ~2.5x faster than sam3)')
+    parser.add_argument('--sam3-engines', type=str, default='Engines',
+                        help='Directory containing TRT .engine files + tokenizer.json '
+                             'for --detector sam3-trt (default: "Engines")')
+    parser.add_argument('--sam3-prompt', type=str, default='women in white top and jeans',
+                        help='Text prompt for SAM3 detector (default: "humans")')
+    parser.add_argument('--sam3-fp16', action='store_true',
+                        help='Run SAM3 in float16 for ~2x faster inference on CUDA.')
+    parser.add_argument('--sam3-compile', action='store_true',
+                        help='Enable torch.compile on SAM3 for 10-30%% faster inference '
+                             '(longer startup warmup). Requires Triton to be installed.')
+    parser.add_argument('--detection-output', type=str, default='mask',
+                        choices=['mask', 'box'],
+                        help='What to pass to DINO: "mask" = segmentation mask applied to crop '
+                             '(default), "box" = raw bounding-box crop (mask ignored)')
     parser.add_argument('--match-threshold', type=float, default=0.3,
-                        help='Cosine distance threshold for reID matching (default: 0.35)')
+                        help='Cosine distance threshold for reID matching (default: 0.20)')
     parser.add_argument('--gallery-size', type=int, default=100,
-                        help='Number of feature vectors stored per track (default: 10)')
+                        help='Number of feature vectors stored per track (default: 100)')
+    parser.add_argument('--ema-alpha', type=float, default=0.9,
+                        help='EMA blend weight for stage-1 matching (0-1, default: 0.8). '
+                             'Higher = slower adaptation to appearance changes.')
     parser.add_argument('--dino-model', type=str, default='dinov2_vitb14_reg',
                         help='Feature extractor model. DINOv2: dinov2_vits14, dinov2_vitb14, '
                              'dinov2_vitb14_reg, dinov2_vitl14, dinov2_vitg14. '
                              'DINOv3: dinov3_vits16, dinov3_vitb16, dinov3_vitl16. '
                              '(default: dinov2_vitb14_reg)')
+    parser.add_argument('--merge-threshold', type=float, default=0.15,
+                        help='EMA cosine distance below which two tracks are merged into one '
+                             '(0=always merge, 2=never). Should be < match-threshold. '
+                             'Set to 0 to disable merging. (default: 0.15)')
+    parser.add_argument('--dormant-timeout', type=float, default=5.0,
+                        help='Seconds without a detection before a track is deleted. '
+                             'Set to 0 to disable pruning. (default: 5.0)')
     args = parser.parse_args()
 
     profiler.enable()
@@ -109,7 +137,7 @@ def main():
     print("q - Quit")
     print("s - Toggle video saving")
     print("p - Toggle profiling output")
-    print("y - Toggle YOLO detection overlay")
+    print("y - Toggle detection overlay")
     print("i - Save screenshot")
     print("================\n")
 
@@ -121,14 +149,32 @@ def main():
         device = args.device
 
     try:
-        detector = YOLODetector(
-            model_path=args.model_path,
-            conf_threshold=args.conf_threshold,
-            device=device,
-            use_tensorrt=args.use_tensorrt,
-        )
+        if args.detector == 'sam3':
+            from sam3_detector import SAM3Detector
+            detector = SAM3Detector(
+                prompt=args.sam3_prompt,
+                conf_threshold=args.conf_threshold,
+                device=device,
+                fp16=args.sam3_fp16,
+                compile=args.sam3_compile,
+            )
+        elif args.detector == 'sam3-trt':
+            from sam3_trt_detector import SAM3TRTDetector
+            detector = SAM3TRTDetector(
+                prompt=args.sam3_prompt,
+                conf_threshold=args.conf_threshold,
+                engines_dir=args.sam3_engines,
+                device=device,
+            )
+        else:
+            detector = YOLODetector(
+                model_path=args.model_path,
+                conf_threshold=args.conf_threshold,
+                device=device,
+                use_tensorrt=args.use_tensorrt,
+            )
     except Exception as e:
-        print(f"Error initialising YOLO detector: {e}")
+        print(f"Error initialising detector: {e}")
         return
 
     # ---- Tracker (no DeepSORT) --------------------------------------
@@ -137,6 +183,10 @@ def main():
         max_gallery_size=args.gallery_size,
         min_confidence=args.conf_threshold,
         dino_model=args.dino_model,
+        ema_alpha=args.ema_alpha,
+        merge_threshold=args.merge_threshold,
+        dormant_timeout=args.dormant_timeout,
+        fps=fps if not is_live else None,
     )
 
     # ---- Main loop ---------------------------------------------------
@@ -162,16 +212,22 @@ def main():
         frame_count += 1
 
         detections = detector.detect(frame)
+
+        # When --detection-output=box, strip masks so DINO uses raw bounding-box crops
+        if args.detection_output == 'box':
+            detections = [d[:6] + [None] for d in detections]
+
         tracks = tracker.update(frame, detections)
 
         display_frame = frame.copy()
 
-        # YOLO raw detections (blue)
+        # Raw detections overlay (blue)
         if show_yolo_debug:
+            det_label = {"sam3": "SAM3", "sam3-trt": "SAM3-TRT"}.get(args.detector, "YOLO")
             for det in detections:
                 x1, y1, x2, y2, conf, *_ = det
                 cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 1)
-                cv2.putText(display_frame, f"YOLO:{conf:.2f}", (int(x1), int(y1) - 5),
+                cv2.putText(display_frame, f"{det_label}:{conf:.2f}", (int(x1), int(y1) - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
         # Tracked objects
@@ -202,9 +258,15 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                     (0, 255, 0) if profiling_enabled else (0, 0, 255), 2)
         cv2.putText(display_frame,
-                    f"[SimpleReID | thr={args.match_threshold}]",
+                    f"[SimpleReID | det={args.detector}"
+                    + (f" prompt='{args.sam3_prompt}'"
+                       + (" fp16" if args.sam3_fp16 else "")
+                       if args.detector == 'sam3' else "")
+                    + (f" prompt='{args.sam3_prompt}' trt"
+                       if args.detector == 'sam3-trt' else "")
+                    + f" | out={args.detection_output} | thr={args.match_threshold}]",
                     (10, display_frame.shape[0] - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         # Video writer
         if save_video and video_writer is None:

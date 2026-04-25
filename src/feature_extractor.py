@@ -85,8 +85,23 @@ class FeatureExtractor:
                 self._build_standard_transform()
             else:  # 'hf'
                 print(f"Loading {dino_model} via Hugging Face Transformers ({repo_or_id})")
-                from transformers import AutoImageProcessor, AutoModel
-                self._hf_processor = AutoImageProcessor.from_pretrained(repo_or_id)
+                from transformers import AutoImageProcessor, AutoModel, ViTImageProcessor
+                try:
+                    self._hf_processor = AutoImageProcessor.from_pretrained(repo_or_id)
+                except Exception as proc_err:
+                    # DINOv3 uses 'DINOv3ViTImageProcessorFast' which may not be registered
+                    # in the installed transformers version; fall back to ViTImageProcessor
+                    # with the same standard ImageNet parameters.
+                    print(f"AutoImageProcessor failed ({proc_err.__class__.__name__}), "
+                          f"using ViTImageProcessor with standard ImageNet settings")
+                    self._hf_processor = ViTImageProcessor(
+                        size={"height": 224, "width": 224},
+                        image_mean=[0.485, 0.456, 0.406],
+                        image_std=[0.229, 0.224, 0.225],
+                        do_resize=True,
+                        do_normalize=True,
+                        do_rescale=True,
+                    )
                 self.model = AutoModel.from_pretrained(repo_or_id)
                 # HF models ship with their own preprocessor; no manual transform needed.
                 self.transform = None
