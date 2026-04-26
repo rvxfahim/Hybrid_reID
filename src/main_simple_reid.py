@@ -63,18 +63,20 @@ def scale_frame(frame, target_width=TARGET_WIDTH, target_height=TARGET_HEIGHT,
 def main():
     parser = argparse.ArgumentParser(description='Experimental DINOv2-only reID pipeline')
     parser.add_argument('--use-tensorrt', action='store_true')
-    parser.add_argument('--model-path', type=str, default=None,
+    parser.add_argument('--model-path', type=str, default='yolov8n.pt',
                         help='Path to YOLO model (default: yolov8n.pt)')
-    parser.add_argument('--video-path', type=str, default='./left_view.mp4')
+    parser.add_argument('--video-path', type=str, default='./cycling.mp4')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--conf-threshold', type=float, default=0.6)
     parser.add_argument('--detector', type=str, default='yolo',
                         choices=['yolo', 'sam3', 'sam3-trt'],
                         help='Detection frontend: "yolo" (default), "sam3" (PyTorch, text-prompted), '
                              'or "sam3-trt" (TensorRT FP16, ~2.5x faster than sam3)')
-    parser.add_argument('--sam3-engines', type=str, default='Engines',
+    parser.add_argument('--sam3-engines', type=str,
+                        default='SAM3-TENSORRT-PYTHON/Engines',
                         help='Directory containing TRT .engine files + tokenizer.json '
-                             'for --detector sam3-trt (default: "Engines")')
+                             'for --detector sam3-trt '
+                             '(default: "SAM3-TENSORRT-PYTHON/Engines")')
     parser.add_argument('--sam3-prompt', type=str, default='women in white top and jeans',
                         help='Text prompt for SAM3 detector (default: "humans")')
     parser.add_argument('--sam3-fp16', action='store_true',
@@ -82,18 +84,18 @@ def main():
     parser.add_argument('--sam3-compile', action='store_true',
                         help='Enable torch.compile on SAM3 for 10-30%% faster inference '
                              '(longer startup warmup). Requires Triton to be installed.')
-    parser.add_argument('--detection-output', type=str, default='mask',
+    parser.add_argument('--detection-output', type=str, default='box',
                         choices=['mask', 'box'],
                         help='What to pass to DINO: "mask" = segmentation mask applied to crop '
                              '(default), "box" = raw bounding-box crop (mask ignored)')
     parser.add_argument('--match-threshold', type=float, default=0.3,
                         help='Cosine distance threshold for reID matching (default: 0.20)')
-    parser.add_argument('--gallery-size', type=int, default=100,
+    parser.add_argument('--gallery-size', type=int, default=2000,
                         help='Number of feature vectors stored per track (default: 100)')
     parser.add_argument('--ema-alpha', type=float, default=0.9,
                         help='EMA blend weight for stage-1 matching (0-1, default: 0.8). '
                              'Higher = slower adaptation to appearance changes.')
-    parser.add_argument('--dino-model', type=str, default='dinov2_vitb14_reg',
+    parser.add_argument('--dino-model', type=str, default='dinov3_vitl16',
                         help='Feature extractor model. DINOv2: dinov2_vits14, dinov2_vitb14, '
                              'dinov2_vitb14_reg, dinov2_vitl14, dinov2_vitg14. '
                              'DINOv3: dinov3_vits16, dinov3_vitb16, dinov3_vitl16. '
@@ -102,7 +104,7 @@ def main():
                         help='EMA cosine distance below which two tracks are merged into one '
                              '(0=always merge, 2=never). Should be < match-threshold. '
                              'Set to 0 to disable merging. (default: 0.15)')
-    parser.add_argument('--dormant-timeout', type=float, default=5.0,
+    parser.add_argument('--dormant-timeout', type=float, default=25.0,
                         help='Seconds without a detection before a track is deleted. '
                              'Set to 0 to disable pruning. (default: 5.0)')
     args = parser.parse_args()

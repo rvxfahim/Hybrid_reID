@@ -133,7 +133,7 @@ class SAM3TRTDetector:
         self,
         prompt: str = "person",
         conf_threshold: float = 0.5,
-        engines_dir: str = "Engines",
+        engines_dir: str = "SAM3-TENSORRT-PYTHON/Engines",
         device: str = "cuda",
     ):
         """
